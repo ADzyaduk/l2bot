@@ -31,6 +31,10 @@ TEON_BASE_OPCODES: dict[str, int] = {
     "StatusUpdate":     0x6D,   # 0x17 ^ 0x7A
     # SkillList = 0x58 (standard L2J CT2). Session-2 observed as 0x22 ^ 0x7A = 0x58.
     "SkillList":        0x58,   # 0x22 ^ 0x7A  (= standard L2J CT2)
+    # Full inventory list (L2J Interlude 0x1B); Teon XOR applies like other S2C opcodes.
+    "ItemList":         0x1B,
+    # Partial inventory (L2J Interlude 0x21); stack changes / removals after use, etc.
+    "InventoryUpdate":  0x21,
     "SystemMessage":    0x62,   # estimated
     "LogoutOk":         0x7F,   # 0x05 ^ 0x7A
     "LeaveWorld":       0x6E,   # 0x14 ^ 0x7A
@@ -38,20 +42,30 @@ TEON_BASE_OPCODES: dict[str, int] = {
     # "ValidatePosition": 0x0E — WRONG on Teon, 0x0E packets contain non-position data
     "StopMove":         0x2D,   # 0x57 ^ 0x7A
     "ChangeWaitType":   0x25,   # 0x5F ^ 0x7A
-    "Die":              0x06,   # standard L2J Die (24B: objectId + flags)
-    "Die2":             0x12,   # secondary death notification (4B: objectId only)
+    # L2J Interlude: 0x06 Die carries objectId + flags (>>4B). Teon observed SC_Die is 4B → Die2 ^ xor_key.
+    "Die":              0x06,
+    "Die2":             0x12,   # 4B objectId — primary death notify on Teon (see registry SC_Die)
     "DeleteObject":     0x72,   # estimated from std L2J 0x08 ^ 0x7A
     "TargetSelected":   0x47,   # 0x3D ^ 0x7A
     "SpawnItem":        0x0C,   # 32-byte packets after mob death (session-2: 0x76)
     "Attack":           0x60,   # 20-byte damage packets during combat (session-2: 0x1A)
     "SkillCoolTime":    0x6A,   # 0x10 ^ 0x7A  (estimated)
+    # MagicSkillLaunched (L2J Interlude S2C 0x48) — not C2S RequestGetItem
+    "MagicSkillLaunched": 0x48,
+    # Active effect icons / buff list (L2J-style AbnormalStatusUpdate 0x7F)
+    "AbnormalStatusUpdate": 0x7F,
     # Teon sends a SECOND StatusUpdate on base 0x0E (standard L2J StatusUpdate opcode).
     # Contains mob HP data (ATTR_MAX_HP, ATTR_CUR_HP). Same format as StatusUpdate.
     "StatusUpdate2":    0x0E,   # standard L2J StatusUpdate opcode — Teon uses it alongside 0x6D
 }
 
-# NpcInfo payload size is fixed at 187 bytes on Teon
+# NpcInfo payload size is fixed at 187 bytes on Teon (detector anchor).
 NPCINFO_PAYLOAD_SIZE = 187
+# Before XOR key is known, BotEngine buffers S2C payloads in this length range as *candidate*
+# NpcInfo (replayed only for opcode matching NpcInfo after detection). Wider than 187 so
+# minor chronicle / padding differences still replay; see logs if false positives appear.
+NPCINFO_PREBUF_LEN_MIN = 180
+NPCINFO_PREBUF_LEN_MAX = 210
 
 # Minimum NpcInfo packets needed before declaring detection complete
 MIN_NPCINFO_COUNT = 5

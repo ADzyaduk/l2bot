@@ -1,0 +1,24 @@
+{
+  "enabled": true,
+  "post_skill_delay": 0.4,
+  "self_buff_precast_delay_sec": 0.35,
+  "magic_skill_payload": "ddd",
+  "buff_skill_packet": "2f",
+  "self_buff_before_cast": "auto",
+  "rules": [
+    {
+      "enabled": true,
+      "skill_id": 91,
+      "interval_sec": 1200.0,
+      "check_buff_skill_id": 91,
+      "rebuff_if_missing": true,
+      "target_mode": "self",
+      "target_object_id": 0,
+      "min_retry_sec": 2.0,
+      "skip_precast_for_self": false,
+      "target_shift_click": true,
+      "skill_force_ctrl": false,
+      "skill_force_shift": false
+    }
+  ]
+}

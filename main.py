@@ -37,6 +37,8 @@ from core.proxy.game_proxy import GameProxyServer
 from core.proxy.session import LoginSession, GameSession
 from core.protocol import registry
 from engine.bot import BotEngine
+from engine.combat_profile import CombatProfile, load_profile
+from engine.buff_profile import BuffProfile, load_buff_profile
 
 
 def load_config(path: str = "config/settings.ini") -> configparser.ConfigParser:
@@ -214,6 +216,28 @@ class BotCore:
         """Thread-safe: toggle sit/stand."""
         if self.loop and self.bot_engine:
             self.loop.call_soon_threadsafe(self.bot_engine.sit_stand)
+
+    def apply_combat_profile(self, profile: CombatProfile) -> None:
+        """Thread-safe: replace auto-combat rule profile (from UI)."""
+        if self.loop and self.bot_engine:
+            self.loop.call_soon_threadsafe(self.bot_engine.set_combat_profile, profile)
+
+    def reload_combat_profile_from_disk(self) -> CombatProfile:
+        """Load profile from config/autocombat.json and apply. Safe from UI thread."""
+        p = load_profile()
+        self.apply_combat_profile(p)
+        return p
+
+    def apply_buff_profile(self, profile: BuffProfile) -> None:
+        """Thread-safe: replace buff maintenance profile (from UI)."""
+        if self.loop and self.bot_engine:
+            self.loop.call_soon_threadsafe(self.bot_engine.set_buff_profile, profile)
+
+    def reload_buff_profile_from_disk(self) -> BuffProfile:
+        """Load config/buffs.json and apply. Safe from UI thread."""
+        p = load_buff_profile()
+        self.apply_buff_profile(p)
+        return p
 
 
 def main() -> None:

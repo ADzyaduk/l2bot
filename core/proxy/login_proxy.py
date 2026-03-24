@@ -23,10 +23,48 @@ import struct
 from typing import Callable
 
 from core.crypto.blowfish_cipher import BlowfishCipher
-from core.crypto.xor_cipher import login_dec_xor_pass, login_enc_xor_pass, login_append_checksum
+from core.crypto.xor_cipher import (
+    login_append_checksum,
+    login_dec_xor_pass,
+    login_enc_xor_pass,
+    login_verify_checksum,
+)
 from core.proxy.session import LoginSession
 
 log = logging.getLogger(__name__)
+
+
+def _login_logical_body_len(body: bytes) -> int:
+    """
+    Blowfish-decrypted login payloads are padded with trailing 0x00 to a multiple
+    of 8. The XOR checksum ends the *logical* packet; padding dwords after it can
+    still satisfy verify(len(body)) spuriously, so we take the smallest end where
+    verify passes and either we consumed the whole buffer or only 0x00 remains.
+    """
+    n = len(body)
+    candidates: list[int] = []
+    for end in range(8, n + 1, 4):
+        if not login_verify_checksum(body, 0, end):
+            continue
+        tail = body[end:]
+        if end < n and any(tail):
+            continue
+        candidates.append(end)
+    return min(candidates) if candidates else n
+
+
+def _reset_login_session_for_new_client(session: LoginSession) -> None:
+    """Each new TCP connection from L2 client must start clean (new BF key from Init)."""
+    session.login_cipher = None
+    session.server_rsa_modulus = b""
+    session.server_blowfish_key = b""
+    session.login_ok1 = 0
+    session.login_ok2 = 0
+    session.play_ok1 = 0
+    session.play_ok2 = 0
+    session.game_host = ""
+    session.game_port = 7777
+
 
 # Login Server opcodes (server → client)
 LS_INIT          = 0x00
@@ -181,47 +219,86 @@ class _LoginRelayProtocol(asyncio.Protocol):
             # Parse real server IPs, store them, then PATCH the packet
             # replacing each real game server IP with 127.0.0.1 so the client
             # connects to our GameProxy instead of the real server directly.
+            #
+            # Base entry: id(1) ip(4) port(4) age(1) pvp(1) online(2) max(2) status(1) = 16 B.
+            # Many L2J forks append extra fields per server (typ. 23 B total); infer stride
+            # from (logical_len - header - checksum) // count after stripping BF padding.
+            # Skip rows with invalid TCP port (placeholders); continue so other slots still patch.
             if len(body) > 3:
+                logical_len = _login_logical_body_len(body)
+                pad_suffix = body[logical_len:]
+                if len(pad_suffix):
+                    log.debug(
+                        "[LoginProxy] ServerList: stripped %d Blowfish pad byte(s), logical_len=%d",
+                        len(pad_suffix),
+                        logical_len,
+                    )
                 count = body[1]
-                log.info("[LoginProxy] Server list: %d servers", count)
+                log.info("[LoginProxy] Server list: advertised count=%d", count)
                 pos = 3  # skip opcode(1) + count(1) + last_server(1)
-                patched = bytearray(body)
-                for _ in range(count):
-                    if pos + 9 > len(body):
-                        break
-                    svr_id = body[pos]
-                    # Interlude entry: [1 serverId][4 ip][4 port][1 ageLimit][1 isPvp]
-                    #                  [2 online][2 maxPlayers][1 status] = 16 bytes
-                    ip_bytes = body[pos + 1: pos + 5]
-                    port = struct.unpack_from("<I", body, pos + 5)[0]
-                    ip = ".".join(str(b) for b in ip_bytes)
-                    log.info("[LoginProxy] Server %d: %s:%d → redirecting to 127.0.0.1:%d",
-                             svr_id, ip, port, self._session.listen_game_port)
+                patched = bytearray(body[:logical_len])
+                chk_start = len(patched) - 4  # first byte of XOR checksum (exclusive end for entries)
+                patched_any = False
 
-                    # Store real game server for GameProxy to connect to
+                payload_for_stride = chk_start - pos
+                stride = 16
+                if count > 0 and payload_for_stride > 0 and payload_for_stride % count == 0:
+                    stride = payload_for_stride // count
+                if stride < 9:
+                    stride = 16
+                log.debug("[LoginProxy] ServerList: entry stride=%d bytes", stride)
+
+                for idx in range(count):
+                    if pos + stride > chk_start:
+                        log.warning(
+                            "[LoginProxy] ServerList: entry %d overflows packet (pos=%d, chk_start=%d)",
+                            idx, pos, chk_start,
+                        )
+                        break
+                    svr_id = patched[pos]
+                    ip_bytes = bytes(patched[pos + 1: pos + 5])
+                    port = struct.unpack_from("<I", patched, pos + 5)[0]
+                    ip = ".".join(str(b) for b in ip_bytes)
+
+                    if not (1 <= port <= 65535):
+                        log.warning(
+                            "[LoginProxy] ServerList: skip bogus entry %d at pos %d (%s:%s)",
+                            idx, pos, ip, port,
+                        )
+                        pos += stride
+                        continue
+
+                    log.info(
+                        "[LoginProxy] Server %d: %s:%d → redirecting to 127.0.0.1:%d",
+                        svr_id, ip, port, self._session.listen_game_port,
+                    )
+
                     if not self._session.game_host:
                         self._session.game_host = ip
                         self._session.game_port = port
                         if self._session.on_game_server_discovered:
                             self._session.on_game_server_discovered(ip, port)
 
-                    # Patch: replace real IP with 127.0.0.1
                     patched[pos + 1: pos + 5] = b"\x7f\x00\x00\x01"
-                    # Patch: replace real port with our listen_game_port (4 bytes)
                     struct.pack_into("<I", patched, pos + 5, self._session.listen_game_port)
+                    patched_any = True
+                    pos += stride
 
-                    pos += 16  # Interlude server entry = 16 bytes
-
-                # Recalculate checksum at last 4 bytes (L2Net appendChecksum)
-                size = len(patched)
-                if size >= 8:
-                    chk = 0
-                    for i in range(0, size - 4, 4):
-                        chk ^= struct.unpack_from("<I", patched, i)[0]
-                    struct.pack_into("<I", patched, size - 4, chk & 0xFFFFFFFF)
-
-                log.info("[LoginProxy] ServerList patched — client will connect to our GameProxy")
-                return bytes(patched)  # return modified packet
+                if patched_any:
+                    if len(patched) >= 8:
+                        login_append_checksum(patched, 0, len(patched))
+                    out = bytes(patched) + pad_suffix
+                    if len(out) != len(body):
+                        log.warning(
+                            "[LoginProxy] ServerList: patched len %d != original %d — forwarding raw",
+                            len(out),
+                            len(body),
+                        )
+                        return None
+                    log.info("[LoginProxy] ServerList patched — client will connect to our GameProxy")
+                    return out
+                log.warning("[LoginProxy] ServerList: no valid entries patched — forwarding unchanged")
+                return None
 
         return None
 
@@ -272,6 +349,7 @@ class LoginProxyServer:
 
     def _client_connected(self) -> asyncio.Protocol:
         """Factory: called by asyncio when a new client connects."""
+        _reset_login_session_for_new_client(self.session)
         c2s = _LoginRelayProtocol(None, self.session, "c2s")
         s2c = _LoginRelayProtocol(None, self.session, "s2c")
 

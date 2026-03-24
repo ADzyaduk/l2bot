@@ -1,23 +1,25 @@
 """Settings tab — server config, chronicle, l2 path, log level."""
 import configparser
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import filedialog, messagebox, ttk
+
+from ui import theme
 
 
 class SettingsTab:
     def __init__(self, parent, bot):
         self.bot = bot
-        self.frame = ttk.Frame(parent)
+        self.frame = ttk.Frame(parent, style=theme.S_FRAME)
         self._vars: dict[str, tk.StringVar] = {}
         self._build()
         self._load_from_cfg()
 
     def _build(self) -> None:
         f = self.frame
-        ttk.Label(f, text="Settings", font=("Consolas", 11, "bold")).pack(pady=(8, 4))
+        ttk.Label(f, text="Settings", style=theme.S_TITLE).pack(pady=(10, 6), padx=12, anchor="w")
 
-        grid = ttk.LabelFrame(f, text="Server")
-        grid.pack(fill=tk.X, padx=16, pady=4)
+        grid = ttk.LabelFrame(f, text="Server", style=theme.S_LF)
+        grid.pack(fill=tk.X, padx=12, pady=6)
 
         fields = [
             ("Login Server Host", "server.login_host"),
@@ -26,35 +28,33 @@ class SettingsTab:
             ("Game Server Port", "server.game_port"),
         ]
         for row, (label, key) in enumerate(fields):
-            ttk.Label(grid, text=label + ":", width=22, anchor="e").grid(
-                row=row, column=0, sticky="e", pady=2, padx=(4, 6)
+            ttk.Label(grid, text=label + ":", style=theme.S_LABEL, width=22, anchor="e").grid(
+                row=row, column=0, sticky="e", pady=3, padx=(8, 6)
             )
             var = tk.StringVar()
             self._vars[key] = var
-            ttk.Entry(grid, textvariable=var, width=24).grid(row=row, column=1, sticky="w")
+            ttk.Entry(grid, textvariable=var, width=28, style=theme.S_ENTRY).grid(row=row, column=1, sticky="w", pady=3)
 
-        # Chronicle
-        chron_frame = ttk.LabelFrame(f, text="Chronicle")
-        chron_frame.pack(fill=tk.X, padx=16, pady=4)
+        chron_frame = ttk.LabelFrame(f, text="Chronicle", style=theme.S_LF)
+        chron_frame.pack(fill=tk.X, padx=12, pady=6)
         self._vars["chronicle.name"] = tk.StringVar(value="interlude")
         ttk.OptionMenu(chron_frame, self._vars["chronicle.name"],
-                       "interlude", "interlude", "c4", "h5").pack(padx=8, pady=4, anchor="w")
+                       "interlude", "interlude", "c4", "h5").pack(padx=10, pady=6, anchor="w")
 
-        # L2 Client
-        client_frame = ttk.LabelFrame(f, text="L2 Client")
-        client_frame.pack(fill=tk.X, padx=16, pady=4)
-        row2 = ttk.Frame(client_frame)
-        row2.pack(fill=tk.X, padx=4, pady=4)
-        ttk.Label(row2, text="L2.exe path:", width=14, anchor="e").pack(side=tk.LEFT)
+        client_frame = ttk.LabelFrame(f, text="L2 client", style=theme.S_LF)
+        client_frame.pack(fill=tk.X, padx=12, pady=6)
+        row2 = ttk.Frame(client_frame, style=theme.S_FRAME)
+        row2.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Label(row2, text="L2.exe path:", style=theme.S_LABEL, width=14, anchor="e").pack(side=tk.LEFT)
         self._vars["client.l2_path"] = tk.StringVar()
-        ttk.Entry(row2, textvariable=self._vars["client.l2_path"], width=40).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row2, text="Browse...", command=self._browse_l2).pack(side=tk.LEFT)
+        ttk.Entry(row2, textvariable=self._vars["client.l2_path"], width=42, style=theme.S_ENTRY).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(row2, text="Browse…", command=self._browse_l2, style=theme.S_BTN).pack(side=tk.LEFT)
 
-        # Buttons
-        btn_frame = ttk.Frame(f)
-        btn_frame.pack(pady=8)
-        ttk.Button(btn_frame, text="Save", command=self._save, width=12).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_frame, text="Reload", command=self._load_from_cfg, width=12).pack(side=tk.LEFT, padx=6)
+        btn_frame = ttk.Frame(f, style=theme.S_FRAME)
+        btn_frame.pack(pady=12)
+        ttk.Button(btn_frame, text="Save", command=self._save, style=theme.S_BTN).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_frame, text="Reload", command=self._load_from_cfg, style=theme.S_BTN).pack(side=tk.LEFT, padx=6)
 
     def _browse_l2(self) -> None:
         path = filedialog.askopenfilename(
@@ -95,4 +95,4 @@ class SettingsTab:
                 cfg.set(section, option, self._vars[var_key].get())
         with open("config/settings.ini", "w", encoding="utf-8") as fh:
             cfg.write(fh)
-        tk.messagebox.showinfo("Settings", "Settings saved. Restart to apply changes.")
+        messagebox.showinfo("Settings", "Settings saved. Restart to apply changes.")

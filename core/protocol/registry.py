@@ -36,6 +36,8 @@ INTERLUDE_SERVER_OPCODES: dict[int, str] = {
     0x7B: "SC_MoveToPoint",     # 24 bytes, frequent entity movement
     0x17: "SC_StatusUpdate",    # 8 bytes, HP/MP/CP/EXP update
     0x7E: "SC_SkillList",       # 559 bytes, appears on login
+    # Base Interlude 0x21; session-2 with XOR 0x7A → 0x5B (for sniffer labels only).
+    0x5B: "SC_InventoryUpdate",
     0x22: "SC_SystemMessage",
     0x1B: "SC_PickupItem",
     0x05: "SC_LogoutOk",
@@ -77,7 +79,7 @@ INTERLUDE_CLIENT_OPCODES: dict[int, str] = {
     0x08: "CS_AuthLogin",         # game server auth (play_ok tokens)
     0x09: "CS_CharSelected",
     0x0A: "CS_AttackRequest",     # forced attack (Ctrl+click)
-    0x2F: "CS_RequestActionAttack",  # actionId=16, real Teon attack command
+    0x2F: "CS_RequestActionAttack",  # actionId=16 attack; skillId when casting from shortcut (Teon)
     0x0D: "CS_RequestGMList",
     0x0F: "CS_MoveBackwardToLocation2",
     0x10: "CS_ValidatePosition",

@@ -9,6 +9,8 @@ from core.protocol.base_packet import BasePacket
 from core.protocol.packet_writer import build_packet
 from core.crypto.blowfish_cipher import BlowfishCipher
 from core.crypto.checksum import verify
+from core.packets import client as csp
+from engine.buff_profile import normalize_buff_skill_packet
 
 
 class TestBasePacket:
@@ -72,3 +74,23 @@ class TestPacketWriter:
         assert decrypted[1:5] == payload
         # Checksum at end should be valid
         assert verify(decrypted)
+
+
+class TestTeonShortcutSkill:
+    def test_build_shortcut_skill_use_matches_sniff(self):
+        op, payload = csp.build_shortcut_skill_use(91, False, False)
+        assert op == 0x2F
+        assert payload.hex() == "5b0000000000000000"
+        full = bytes([op]) + payload
+        assert full.hex() == "2f5b0000000000000000"
+
+    def test_build_force_attack_unchanged(self):
+        op, payload = csp.build_force_attack()
+        assert op == 0x2F
+        assert payload.hex() == "100000000000000000"
+
+    def test_normalize_buff_skill_packet(self):
+        assert normalize_buff_skill_packet("2f") == "2f"
+        assert normalize_buff_skill_packet("39") == "39"
+        assert normalize_buff_skill_packet("0x2f") == "2f"
+        assert normalize_buff_skill_packet("garbage") == "39"

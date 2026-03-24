@@ -20,13 +20,28 @@ import logging
 import struct
 from typing import Callable, Awaitable
 
+# Logged at INFO without enabling full packet DEBUG (see _handle_client_to_server).
+_C2S_INFO_PLAIN_OPCODES = frozenset({
+    0x04,  # Action
+    0x0A,  # AttackRequest
+    0x19,  # RequestItemUse
+    0x2F,  # Force attack (Teon)
+    0x37,  # RequestTargetCancel
+    0x39,  # RequestMagicSkillUse
+    0x45,  # RequestActionUse
+    0x48,  # RequestGetItem (pickup) — same opcode on some builds
+})
+
 from core.crypto.blowfish_cipher import BlowfishCipher, DEFAULT_KEY
 from core.crypto.checksum import append as append_checksum, verify as verify_checksum
 from core.crypto.xor_cipher import L2GameCrypt
 from core.proxy.session import GameSession
 from core.protocol.registry import get_server_packet_name, get_client_packet_name
+from core.protocol.packet_categories import s2c_category_tag
 
 log = logging.getLogger(__name__)
+# High-volume S2C/C2S lines go here so the UI can show them on a separate "Packets" pane.
+pktlog = logging.getLogger("l2bot.packets")
 
 # Game Server opcodes relevant to the proxy itself
 GS_BLOWFISH_INIT = 0x00   # server sends session Blowfish key
@@ -123,12 +138,18 @@ class _GameRelayProtocol(asyncio.Protocol):
         payload = plain[1:-4] if len(plain) > 5 else plain[1:]
 
         name = get_server_packet_name(opcode)
+        cat = s2c_category_tag(name)
+        tag = f"[{cat}] " if cat else ""
         # Reduce log noise: frequent movement/tick packets → DEBUG
         _quiet_s2c = {0x01, 0x2D, 0x16}
         if opcode in _quiet_s2c:
-            log.debug("[S→C] 0x%02X %s (%d bytes payload)", opcode, name, len(payload))
+            pktlog.debug(
+                "[S→C]%s0x%02X %s (%d bytes payload)", tag, opcode, name, len(payload),
+            )
         else:
-            log.info("[S→C] 0x%02X %s (%d bytes payload)", opcode, name, len(payload))
+            pktlog.info(
+                "[S→C]%s0x%02X %s (%d bytes payload)", tag, opcode, name, len(payload),
+            )
 
         if opcode == GS_CRYPT_INIT:
             self._handle_crypt_init(payload)
@@ -214,7 +235,17 @@ class _GameRelayProtocol(asyncio.Protocol):
             opcode = plain[0] if plain else 0xFF
             payload = plain[1:]  # game server C2S has NO checksum
             name = get_client_packet_name(opcode)
-            log.debug("[C→S] 0x%02X %s (%d bytes) plain=%s", opcode, name, len(payload), plain.hex())
+            # Default logger level is INFO: DEBUG lines were invisible unless user toggled "Debug C→S".
+            if pktlog.isEnabledFor(logging.DEBUG):
+                pktlog.debug(
+                    "[C→S] 0x%02X %s (%d bytes) plain=%s",
+                    opcode, name, len(payload), plain.hex(),
+                )
+            elif opcode in _C2S_INFO_PLAIN_OPCODES:
+                pktlog.info(
+                    "[C→S] 0x%02X %s (%d bytes) plain=%s",
+                    opcode, name, len(payload), plain.hex(),
+                )
         else:
             # Before crypto init — forward transparently
             if self._peer and self._peer._transport:

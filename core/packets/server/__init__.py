@@ -4,6 +4,7 @@ Server → Client packet parsers for Lineage 2 Interlude.
 Each class parses a raw payload (bytes after opcode, before checksum)
 using BasePacket cursor helpers.
 """
+import struct
 from dataclasses import dataclass, field
 from core.protocol.base_packet import BasePacket
 
@@ -266,6 +267,29 @@ class MoveToPoint:
 
 
 # ------------------------------------------------------------------ #
+# SC_ChangeWaitType  (base 0x25 Teon) —  sit / stand / movement mode
+# L2J: writeD(objectId); writeD(type). Binary forks: 0=sit 1=stand (Acis) or inverted.
+# ------------------------------------------------------------------ #
+@dataclass
+class ChangeWaitType:
+    opcode = 0x25
+
+    object_id: int = 0
+    wait_type: int = 0
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "ChangeWaitType":
+        self = cls()
+        if len(payload) < 8:
+            return self
+        try:
+            self.object_id, self.wait_type = struct.unpack_from("<ii", payload, 0)
+        except struct.error:
+            pass
+        return self
+
+
+# ------------------------------------------------------------------ #
 # SC_Die  0x06  —  unit died
 # ------------------------------------------------------------------ #
 @dataclass
@@ -378,6 +402,84 @@ class SpawnItem:
 
 
 # ------------------------------------------------------------------ #
+# SC_SkillList 0x58 — known skills (id, level, passive); no names in Interlude
+# ------------------------------------------------------------------ #
+@dataclass
+class SkillList:
+    """L2J Interlude format: count, then per skill: passive(D), level(D), id(D), unk(C)."""
+
+    skills: list[tuple[int, int, bool]] = field(default_factory=list)
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "SkillList":
+        p = BasePacket(payload)
+        self = cls()
+        try:
+            n = p.read_int()
+            for _ in range(max(0, min(n, 5000))):
+                passive_flag = p.read_int()
+                level = p.read_int()
+                sid = p.read_int()
+                if p.remaining() >= 1:
+                    p.read_byte()
+                self.skills.append((sid, level, passive_flag != 0))
+        except Exception:
+            pass
+        return self
+
+
+# ------------------------------------------------------------------ #
+# SC_MagicSkillLaunched 0x48 (L2J Interlude) — caster, target, skill, level, hit/reuse, x,y,z
+# Same opcode as C2S RequestGetItem; direction distinguishes. Payload is 32 or 36 bytes (9× int32).
+# ------------------------------------------------------------------ #
+@dataclass
+class MagicSkillLaunched:
+    caster_id: int = 0
+    target_id: int = 0
+    skill_id: int = 0
+    skill_level: int = 0
+    hit_time: int = 0
+    reuse_delay: int = 0
+    x: int = 0
+    y: int = 0
+    z: int = 0
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "MagicSkillLaunched":
+        self = cls()
+        n = len(payload)
+        if n < 32:
+            return self
+        try:
+            if n >= 36:
+                (
+                    self.caster_id,
+                    self.target_id,
+                    self.skill_id,
+                    self.skill_level,
+                    self.hit_time,
+                    self.reuse_delay,
+                    self.x,
+                    self.y,
+                    self.z,
+                ) = struct.unpack_from("<9i", payload, 0)
+            else:
+                (
+                    self.caster_id,
+                    self.target_id,
+                    self.skill_id,
+                    self.skill_level,
+                    self.hit_time,
+                    self.reuse_delay,
+                    self.x,
+                    self.y,
+                ) = struct.unpack_from("<8i", payload, 0)
+        except struct.error:
+            pass
+        return self
+
+
+# ------------------------------------------------------------------ #
 # SC_Attack  —  damage / hit notification
 # ------------------------------------------------------------------ #
 @dataclass
@@ -400,6 +502,327 @@ class Attack:
             self.damage = p.read_int()
             self.flags = p.read_int()
             self.x = p.read_int()
+        except Exception:
+            pass
+        return self
+
+
+# ------------------------------------------------------------------ #
+# SC_ItemList 0x1B — full inventory (L2J Interlude layout)
+# H showWindow, H count, then per item fixed block (type1, objectId, itemId, count, ...).
+# ------------------------------------------------------------------ #
+@dataclass
+class ItemList:
+    """Inventory snapshot from server. item_id = template id (datapack)."""
+
+    show_window: bool = False
+    items: list[tuple[int, int, int]] = field(default_factory=list)
+    # (object_id, item_id template, stack count)
+
+    # Bytes per item after L2J Interlude ItemList loop body (incl. 8-byte aug slot).
+    _ENTRY_STRIDE = 36
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "ItemList":
+        p = BasePacket(payload)
+        self = cls()
+        try:
+            show = p.read_ushort()
+            self.show_window = show != 0
+            count = p.read_ushort()
+            if count < 0 or count > 5000:
+                return self
+            for _ in range(count):
+                if p.remaining() < cls._ENTRY_STRIDE:
+                    break
+                p.read_ushort()  # type1
+                oid = p.read_int()
+                iid = p.read_int()
+                cnt = p.read_int()
+                self.items.append((oid, iid, cnt))
+                p.read_bytes(cls._ENTRY_STRIDE - 14)  # rest of entry
+        except Exception:
+            pass
+        return self
+
+
+# ------------------------------------------------------------------ #
+# SC_SkillCoolTime — reuse delays (L2J: count D then per row D skillId, D remain, D total)
+# ------------------------------------------------------------------ #
+@dataclass
+class SkillCoolTime:
+    rows: list[tuple[int, int, int]] = field(default_factory=list)
+    # skill_id, remaining_ms (or server units), total_ms
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "SkillCoolTime":
+        p = BasePacket(payload)
+        self = cls()
+        try:
+            if p.remaining() >= 4:
+                n = p.read_int()
+                if 0 < n <= 500 and p.remaining() >= n * 12:
+                    for _ in range(n):
+                        sid = p.read_int()
+                        rem = p.read_int()
+                        tot = p.read_int()
+                        self.rows.append((sid, rem, tot))
+                    return self
+            p = BasePacket(payload)
+            while p.remaining() >= 12:
+                self.rows.append((p.read_int(), p.read_int(), p.read_int()))
+        except Exception:
+            pass
+        return self
+
+
+# ------------------------------------------------------------------ #
+# SC_AbnormalStatusUpdate 0x7F — buffs / abnormal effects (skill ids + duration)
+# ------------------------------------------------------------------ #
+def _abnormal_skill_id_sane(sid: int) -> bool:
+    """Reject obvious garbage from wrong layout (oid fragments as skill id)."""
+    return 1 <= sid <= 200_000
+
+
+@dataclass
+class AbnormalStatusUpdate:
+    object_id: int = 0
+    effects: list[tuple[int, int, int]] = field(default_factory=list)
+    # skill_id, skill_level, duration
+    # True when payload is a strict «oid + count 0» (or ii layout) empty list — not a parse fallback.
+    explicit_empty: bool = False
+
+    _EFFECT_STRIDE = 10  # int32 + int16 + int32
+
+    @classmethod
+    def _read_effects(
+        cls, payload: bytes, offset: int, count: int
+    ) -> tuple[list[tuple[int, int, int]], int] | None:
+        end = offset + count * cls._EFFECT_STRIDE
+        if count <= 0 or count > 64 or end > len(payload):
+            return None
+        effects: list[tuple[int, int, int]] = []
+        off = offset
+        for _ in range(count):
+            sid, lvl, dur = struct.unpack_from("<ihI", payload, off)
+            if not _abnormal_skill_id_sane(sid):
+                return None
+            effects.append((sid, lvl, dur))
+            off += cls._EFFECT_STRIDE
+        return effects, end
+
+    @classmethod
+    def _try_legacy_abnormal(cls, payload: bytes) -> "AbnormalStatusUpdate | None":
+        """L2J Interlude: H count or D oid + H count + effects."""
+        p = BasePacket(payload)
+        need_per = cls._EFFECT_STRIDE
+        n = len(payload)
+        try:
+            p._pos = 0
+            count_a = p.read_ushort()
+            need_a = 2 + count_a * need_per
+            count_b = 0
+            oid_b = 0
+            if n >= 6:
+                p._pos = 0
+                oid_b = p.read_int()
+                count_b = p.read_ushort()
+            need_b = 6 + count_b * need_per if count_b > 0 else 0
+
+            use_b = (
+                0 < count_b <= 64
+                and n >= need_b
+                and (count_a > 64 or n < need_a or abs(n - need_b) < abs(n - need_a))
+            )
+            if use_b and need_b > 0:
+                p._pos = 6
+                oid = oid_b
+                count = count_b
+            elif 0 < count_a <= 64 and n >= need_a:
+                p._pos = 2
+                oid = 0
+                count = count_a
+            else:
+                return None
+
+            if p.remaining() < count * need_per:
+                return None
+            effects: list[tuple[int, int, int]] = []
+            for _ in range(count):
+                sid = p.read_int()
+                lvl = p.read_short()
+                dur = p.read_int()
+                if not _abnormal_skill_id_sane(sid):
+                    return None
+                effects.append((sid, lvl, dur))
+            return AbnormalStatusUpdate(oid, effects)
+        except Exception:
+            return None
+
+    @classmethod
+    def _try_empty_abnormal(cls, payload: bytes) -> "AbnormalStatusUpdate | None":
+        """Full snapshot with zero effects: int32 oid + uint16 count 0 (+ optional 2-byte pad), or ii with count 0.
+
+        We require oid != 0 so all-zero / oid-0 stubs are not treated as authoritative (avoids rebuff spam).
+        """
+        n = len(payload)
+        if n == 6:
+            oid, cnt = struct.unpack_from("<iH", payload, 0)
+            if cnt == 0 and oid != 0:
+                return AbnormalStatusUpdate(oid, [], explicit_empty=True)
+            return None
+        if n == 8:
+            oid, cnt = struct.unpack_from("<iH", payload, 0)
+            if cnt == 0 and oid != 0:
+                return AbnormalStatusUpdate(oid, [], explicit_empty=True)
+            oid2, cnt2 = struct.unpack_from("<ii", payload, 0)
+            if cnt2 == 0 and oid2 != 0:
+                return AbnormalStatusUpdate(oid2, [], explicit_empty=True)
+            return None
+        return None
+
+    @classmethod
+    def _try_dword_count(cls, payload: bytes) -> "AbnormalStatusUpdate | None":
+        """Some forks: int32 count @0, then effects (no object id)."""
+        n = len(payload)
+        if n < 4:
+            return None
+        count = struct.unpack_from("<i", payload, 0)[0]
+        got = cls._read_effects(payload, 4, count)
+        if got is None:
+            return None
+        effects, end = got
+        if end > n or n - end > 2:
+            return None
+        return AbnormalStatusUpdate(0, effects)
+
+    @classmethod
+    def _try_oid_dword_count(cls, payload: bytes) -> "AbnormalStatusUpdate | None":
+        """Some Teon / private: int32 objectId, int32 count, then effects."""
+        n = len(payload)
+        if n < 8:
+            return None
+        oid, count = struct.unpack_from("<ii", payload, 0)
+        if oid == 0 or count <= 0 or count > 64:
+            return None
+        got = cls._read_effects(payload, 8, count)
+        if got is None:
+            return None
+        effects, end = got
+        if end > n or n - end > 2:
+            return None
+        return AbnormalStatusUpdate(oid, effects)
+
+    @classmethod
+    def _try_byte_count(cls, payload: bytes) -> "AbnormalStatusUpdate | None":
+        """Rare: uint8 count @0, then effects."""
+        n = len(payload)
+        if n < 1:
+            return None
+        count = payload[0]
+        if count == 0 or count > 64:
+            return None
+        got = cls._read_effects(payload, 1, count)
+        if got is None:
+            return None
+        effects, end = got
+        if end > n or n - end > 2:
+            return None
+        return AbnormalStatusUpdate(0, effects)
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "AbnormalStatusUpdate":
+        if not payload:
+            return AbnormalStatusUpdate()
+        empty = cls._try_empty_abnormal(payload)
+        if empty is not None:
+            return empty
+        opts: list[tuple[int, AbnormalStatusUpdate]] = []
+
+        def push(consumed: int, pkt: AbnormalStatusUpdate) -> None:
+            if not pkt.effects:
+                return
+            pad = len(payload) - consumed
+            exact = 10_000 if 0 <= pad <= 2 else 0
+            opts.append((exact + 100 * len(pkt.effects) + consumed, pkt))
+
+        leg = cls._try_legacy_abnormal(payload)
+        if leg is not None and leg.effects:
+            c = 6 + len(leg.effects) * cls._EFFECT_STRIDE if leg.object_id else 2 + len(leg.effects) * cls._EFFECT_STRIDE
+            push(c, leg)
+
+        for try_fn in (
+            cls._try_oid_dword_count,
+            cls._try_dword_count,
+            cls._try_byte_count,
+        ):
+            alt = try_fn(payload)
+            if alt is None or not alt.effects:
+                continue
+            if try_fn is cls._try_oid_dword_count:
+                cons = 8 + len(alt.effects) * cls._EFFECT_STRIDE
+            elif try_fn is cls._try_dword_count:
+                cons = 4 + len(alt.effects) * cls._EFFECT_STRIDE
+            else:
+                cons = 1 + len(alt.effects) * cls._EFFECT_STRIDE
+            push(cons, alt)
+
+        if not opts:
+            return AbnormalStatusUpdate()
+        return max(opts, key=lambda x: x[0])[1]
+
+
+# ------------------------------------------------------------------ #
+# SC_InventoryUpdate (L2J Interlude base ~0x21) — partial inventory sync
+# ------------------------------------------------------------------ #
+@dataclass
+class InventoryUpdate:
+    """Rows (object_id, template_id, count). template_id==0 and count==0 → remove object_id."""
+
+    items: list[tuple[int, int, int]] = field(default_factory=list)
+
+    _ROW_TAIL = 22  # after type1+oid+iid+cnt inside 36-byte ItemList row
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "InventoryUpdate":
+        self = cls()
+        if not payload:
+            return self
+        # ItemList is H show, H count, count × 36-byte rows. InventoryUpdate delta is
+        # H count, then per-row H(mod) … — do not parse as ItemList unless length fits.
+        if len(payload) >= 4:
+            _show, icnt = struct.unpack_from("<HH", payload, 0)
+            need_il = 4 + icnt * ItemList._ENTRY_STRIDE
+            if icnt == 0 and len(payload) >= 4:
+                il = ItemList.parse(payload)
+                self.items = list(il.items)
+                return self
+            if icnt > 0 and len(payload) >= need_il:
+                il = ItemList.parse(payload)
+                if len(il.items) == icnt:
+                    self.items = list(il.items)
+                    return self
+        p = BasePacket(payload)
+        try:
+            n = p.read_ushort()
+            if n <= 0 or n > 500:
+                return self
+            for _ in range(n):
+                if p.remaining() < 2:
+                    break
+                mod = p.read_ushort()
+                if mod == 3:
+                    if p.remaining() >= 4:
+                        self.items.append((p.read_int(), 0, 0))
+                    continue
+                if p.remaining() < ItemList._ENTRY_STRIDE:
+                    break
+                p.read_ushort()  # type1
+                oid = p.read_int()
+                iid = p.read_int()
+                cnt = p.read_int()
+                self.items.append((oid, iid, cnt))
+                p.read_bytes(cls._ROW_TAIL)
         except Exception:
             pass
         return self

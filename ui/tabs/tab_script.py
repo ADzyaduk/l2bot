@@ -1,41 +1,44 @@
 """Script tab — load, run, stop, pause .SEC scripts."""
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import filedialog, ttk
+
+from ui import theme
 
 
 class ScriptTab:
     def __init__(self, parent, bot):
         self.bot = bot
         self._script_path = tk.StringVar(value="")
-        self.frame = ttk.Frame(parent)
+        self.frame = ttk.Frame(parent, style=theme.S_FRAME)
         self._build()
 
     def _build(self) -> None:
         f = self.frame
-        ttk.Label(f, text="Script Runner", font=("Consolas", 11, "bold")).pack(pady=(8, 4))
+        ttk.Label(f, text="Script runner", style=theme.S_TITLE).pack(pady=(10, 6), padx=12, anchor="w")
 
-        # File picker
-        row = ttk.Frame(f)
-        row.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(row, text="Script:").pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self._script_path, width=45).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="Browse...", command=self._browse).pack(side=tk.LEFT)
+        row = ttk.Frame(f, style=theme.S_FRAME)
+        row.pack(fill=tk.X, padx=12, pady=4)
+        ttk.Label(row, text="Script:", style=theme.S_LABEL).pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self._script_path, width=48, style=theme.S_ENTRY).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="Browse…", command=self._browse, style=theme.S_BTN).pack(side=tk.LEFT)
 
-        # Controls
-        ctrl = ttk.Frame(f)
-        ctrl.pack(pady=4)
-        ttk.Button(ctrl, text="▶  Run", command=self._run, width=10).pack(side=tk.LEFT, padx=4)
-        ttk.Button(ctrl, text="⏸  Pause", command=self._pause, width=10).pack(side=tk.LEFT, padx=4)
-        ttk.Button(ctrl, text="⏹  Stop", command=self._stop, width=10).pack(side=tk.LEFT, padx=4)
+        ctrl = ttk.Frame(f, style=theme.S_FRAME)
+        ctrl.pack(pady=6, padx=12, anchor="w")
+        ttk.Button(ctrl, text="Run", command=self._run, style=theme.S_BTN).pack(side=tk.LEFT, padx=4)
+        ttk.Button(ctrl, text="Pause", command=self._pause, style=theme.S_BTN).pack(side=tk.LEFT, padx=4)
+        ttk.Button(ctrl, text="Stop", command=self._stop, style=theme.S_BTN).pack(side=tk.LEFT, padx=4)
 
-        # Output
-        ttk.Label(f, text="Output:").pack(anchor="w", padx=8)
-        self._out = tk.Text(f, font=("Consolas", 9), bg="#0d0d1a", fg="#ffcc88",
-                            state=tk.DISABLED, height=16)
-        sb = ttk.Scrollbar(f, orient=tk.VERTICAL, command=self._out.yview)
+        ttk.Label(f, text="Output", style=theme.S_SECTION).pack(anchor="w", padx=12, pady=(8, 2))
+        out_fr = tk.Frame(f, bg=theme.COL_PANEL)
+        out_fr.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+        self._out = tk.Text(
+            out_fr, font=theme.FONT_MONO, bg=theme.COL_LOG_BG, fg=theme.COL_WARN,
+            state=tk.DISABLED, height=16, highlightthickness=0, insertbackground=theme.COL_TEAL,
+        )
+        sb = ttk.Scrollbar(out_fr, orient=tk.VERTICAL, command=self._out.yview)
         self._out.configure(yscrollcommand=sb.set)
-        sb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8))
-        self._out.pack(fill=tk.BOTH, expand=True, padx=(8, 0), pady=(0, 8))
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._out.pack(fill=tk.BOTH, expand=True)
 
     def _browse(self) -> None:
         path = filedialog.askopenfilename(
