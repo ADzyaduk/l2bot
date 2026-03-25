@@ -10,24 +10,29 @@ Usage:
 import asyncio
 import logging
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from core.proxy.game_proxy import GameProxyServer
 from core.packets.server import (
     UserInfo, NpcInfo, DeleteObject, StatusUpdate, MoveToPoint, Die, TargetSelected,
     SpawnItem, Attack, SkillList, ItemList, InventoryUpdate, SkillCoolTime,
     AbnormalStatusUpdate, MagicSkillLaunched, ChangeWaitType,
+    PartySpelled,
+    PartySmallWindowAdd,
+    PartySmallWindowAll,
+    PartySmallWindowDelete,
+    ShortBuffStatusUpdate,
 )
 from core.packets import client as cs
 from core import game_reference
 from collections import Counter
 
 from core.protocol.opcode_detector import OpcodeDetector, NPCINFO_PAYLOAD_SIZE
+from engine.character_config import resolve_buff_profile_read_path
 from engine.combat_profile import CombatProfile, load_profile
 from engine.buff_profile import (
     BuffProfile,
     BuffRule,
-    default_buff_profile_path,
     load_buff_profile,
     normalize_buff_skill_packet,
     normalize_magic_skill_payload,
@@ -44,7 +49,10 @@ _MAX_PRE_DETECT_PACKETS = 1200
 # After a buff cast, server may send AbnormalStatusUpdate a bit later — avoid instant «missing» recast.
 _BUFF_ABNORMAL_GRACE_AFTER_CAST_SEC = 4.0
 # Pause after RequestActionUse sit/stand toggle so SC_ChangeWaitType can update me_sitting before the next toggle.
-_RECOVERY_TOGGLE_ACK_SEC = 0.4
+_RECOVERY_TOGGLE_ACK_SEC = 0.5
+# Full SC_UserInfo on Interlude/Teon is hundreds of bytes. Short packets on the same
+# session opcode are opcode-detector collisions — parsing them zeros objectId/name and breaks injects.
+_MIN_SC_USERINFO_PAYLOAD = 100
 
 
 class BotEngine:
@@ -68,9 +76,12 @@ class BotEngine:
         self._combat_phase: str = "idle"
         self._last_incoming_damage_mono: float = 0.0
         self._buff_cast_times: list[float] = []
-        self._combat_profile: CombatProfile = load_profile()
+        self._disk_profile_key: str | None = None
+        self._combat_profile: CombatProfile = load_profile(None)
         self._rule_last_fire: dict[int, float] = {}
-        self._buff_profile: BuffProfile = load_buff_profile()
+        self._buff_profile: BuffProfile = load_buff_profile(None)
+        # BotCore wires this to refresh Auto combat / Buffs tabs after UserInfo.
+        self.profile_tabs_refresh: Optional[Callable[[], None]] = None
         self._buff_last_cast: dict[int, float] = {}
         self._buff_task: Optional[asyncio.Task] = None
         self._magic_skill_combat: str = normalize_magic_skill_payload(
@@ -81,6 +92,9 @@ class BotEngine:
         )
         self._buff_skill_packet: str = normalize_buff_skill_packet(
             self._buff_profile.buff_skill_packet
+        )
+        self._combat_skill_packet: str = normalize_buff_skill_packet(
+            self._combat_profile.combat_skill_packet
         )
         self._c2s_target_cancel_payload: str = normalize_target_cancel_payload(
             self._combat_profile.target_cancel_payload
@@ -105,11 +119,18 @@ class BotEngine:
         self._pre_detect_packets: list[tuple[int, bytes]] = []
         # Post-kill recovery: we sent a sit toggle and must stand in finally (even on timeout / stop combat).
         self._recovery_sent_sit_toggle: bool = False
+        self._auto_combat_last_target_oid: int = 0
+        self._combat_skill_last_cast: dict[int, float] = {}
+        self._move_before_target_warned: bool = False
+        # Combat anchor (x,y,z) set when auto-combat starts; optional leash in World.pick_auto_combat_target.
+        self._combat_anchor: tuple[int, int, int] | None = None
+        self._no_mob_anchor_since: float | None = None
 
     def start(self) -> None:
         """Hook into GameProxy to receive server packets."""
         self.game_proxy.on_server_packet = self._dispatch
         self.game_proxy.on_new_session = self._on_new_session
+        self.game_proxy.on_game_connection_lost = self._on_game_connection_lost
         self._detector.reset()
         log.info("[BotEngine] Started — listening for game packets")
 
@@ -129,8 +150,25 @@ class BotEngine:
         self._last_die_time = 0
         self._rule_last_fire.clear()
         self._recovery_sent_sit_toggle = False
+        self._auto_combat_last_target_oid = 0
+        self._combat_skill_last_cast.clear()
+        self._move_before_target_warned = False
+        self._combat_anchor = None
+        self._no_mob_anchor_since = None
+        self._disk_profile_key = None
+        self.set_combat_profile(load_profile(None))
+        self.set_buff_profile(load_buff_profile(None))
+        self._log_buff_profile_loaded("new_session")
         game_reference.clear_session_extras()
         log.info("[BotEngine] New game session — opcode detector reset")
+
+    def _on_game_connection_lost(self) -> None:
+        """Game TCP closed (client or server leg) — stop bot activity that would spam injects."""
+        log.info("[BotEngine] Game connection lost — stopping auto-combat and buff loop")
+        self.stop_auto_combat()
+        if self._buff_task and not self._buff_task.done():
+            self._buff_task.cancel()
+        self._buff_task = None
 
     def stop(self) -> None:
         self._running = False
@@ -139,6 +177,7 @@ class BotEngine:
         self._buff_task = None
         self.game_proxy.on_server_packet = None
         self.game_proxy.on_new_session = None
+        self.game_proxy.on_game_connection_lost = None
         log.info("[BotEngine] Stopped")
 
     # ------------------------------------------------------------------ #
@@ -183,6 +222,21 @@ class BotEngine:
         cw_op = opcodes.get("ChangeWaitType")
         if cw_op is not None:
             self._handlers[cw_op] = self._on_change_wait_type
+        ps_op = opcodes.get("PartySpelled")
+        if ps_op is not None:
+            self._handlers[ps_op] = self._on_party_spelled
+        pwa = opcodes.get("PartySmallWindowAll")
+        if pwa is not None:
+            self._handlers[pwa] = self._on_party_small_window_all
+        pwad = opcodes.get("PartySmallWindowAdd")
+        if pwad is not None:
+            self._handlers[pwad] = self._on_party_small_window_add
+        pwdd = opcodes.get("PartySmallWindowDelete")
+        if pwdd is not None:
+            self._handlers[pwdd] = self._on_party_small_window_delete
+        sb_op = opcodes.get("ShortBuffStatusUpdate")
+        if sb_op is not None:
+            self._handlers[sb_op] = self._on_short_buff_status_update
         log.info("[BotEngine] Opcodes updated — handlers ready (XOR key=0x%02X)",
                  self._detector.xor_key)
 
@@ -271,12 +325,47 @@ class BotEngine:
     # ------------------------------------------------------------------ #
 
     def _on_user_info(self, payload: bytes) -> None:
+        if len(payload) < _MIN_SC_USERINFO_PAYLOAD:
+            log.debug(
+                "[BotEngine] Skip UserInfo handler: payload too short (%d B, need ≥%d) — wrong S2C type for this opcode",
+                len(payload),
+                _MIN_SC_USERINFO_PAYLOAD,
+            )
+            return
         pkt = UserInfo.parse(payload)
+        if pkt.object_id == 0 or not (pkt.name or "").strip():
+            log.debug(
+                "[BotEngine] Skip UserInfo apply: empty objectId or name after parse (%d B) — likely malformed",
+                len(payload),
+            )
+            return
         self.world.on_user_info(pkt)
         me = self.world.me
         log.info("[World] Me: '%s' objId=0x%X lvl=%d  HP:%d/%d  MP:%d/%d  pos=(%d,%d,%d)",
                  me.name, me.object_id, pkt.level, me.cur_hp, me.max_hp,
                  me.cur_mp, me.max_mp, me.x, me.y, me.z)
+        disk_key = me.name or ""
+        if disk_key != self._disk_profile_key:
+            cp = load_profile(character_name=disk_key)
+            bp = load_buff_profile(character_name=disk_key)
+            self.set_combat_profile(cp)
+            self.set_buff_profile(bp)
+            self._disk_profile_key = disk_key
+            log.info(
+                "[BotEngine] Loaded per-character profiles (key=%r) — see config/characters/",
+                disk_key or "_",
+            )
+            self._log_buff_profile_loaded("character")
+            self._notify_profile_tabs_refresh()
+
+    def _notify_profile_tabs_refresh(self) -> None:
+        cb = self.profile_tabs_refresh
+        if not cb:
+            return
+        try:
+            cb()
+        except Exception:
+            log.exception("[BotEngine] profile_tabs_refresh failed")
 
     def _on_npc_info(self, payload: bytes) -> None:
         # Hex dump first few NpcInfo packets for debugging parser alignment
@@ -393,16 +482,16 @@ class BotEngine:
         if is_me_attacking:
             log.info("[World] I hit objId=0x%X dmg=%d", pkt.target_id, pkt.damage)
         elif is_me_target:
+            self.world.register_attacker_on_me(pkt.attacker_id)
             me = self.world.me
             self._last_incoming_damage_mono = time.monotonic()
-            log.warning(
-                "[World] INCOMING dmg=%d from objId=0x%X (my HP: %d/%d eff_max=%d = %.0f%% safe)",
-                pkt.damage,
+            log.info(
+                "[World] Hit S2C: attacker objId=0x%X → me, SC_Attack damage field=%d "
+                "(HP snapshot %d/%d — often lags UserInfo/StatusUpdate; field may not match UI)",
                 pkt.attacker_id,
+                pkt.damage,
                 me.cur_hp,
                 me.max_hp,
-                me.effective_max_hp(),
-                me.hp_pct_safe,
             )
 
     def _on_skill_list(self, payload: bytes) -> None:
@@ -437,6 +526,9 @@ class BotEngine:
                 pkt.skill_id,
                 pkt.skill_level,
             )
+        if me and pkt.target_id == me and pkt.caster_id and pkt.caster_id != me:
+            self.world.register_attacker_on_me(pkt.caster_id)
+            self._last_incoming_damage_mono = time.monotonic()
 
     def _on_change_wait_type(self, payload: bytes) -> None:
         pkt = ChangeWaitType.parse(payload)
@@ -472,11 +564,75 @@ class BotEngine:
                     len(payload),
                 )
 
+    def _on_party_spelled(self, payload: bytes) -> None:
+        pkt = PartySpelled.parse(payload)
+        if not pkt.effects:
+            return
+        self.world.on_party_spelled(pkt.object_id, pkt.effects)
+        log.debug(
+            "[World] PartySpelled objId=0x%X effects=%d",
+            pkt.object_id,
+            len(pkt.effects),
+        )
+
+    def _on_party_small_window_all(self, payload: bytes) -> None:
+        pkt = PartySmallWindowAll.parse(payload)
+        if pkt.declared_count == 0:
+            self.world.on_party_small_window_all([])
+            log.info("[World] PartySmallWindowAll: party cleared (0 members)")
+            return
+        if not pkt.members:
+            log.debug(
+                "[World] PartySmallWindowAll: skip sync (declared=%d, parsed=0 — layout mismatch?)",
+                pkt.declared_count,
+            )
+            return
+        self.world.on_party_small_window_all(pkt.members)
+        log.info("[World] PartySmallWindowAll: %d member(s)", len(pkt.members))
+
+    def _on_party_small_window_add(self, payload: bytes) -> None:
+        pkt = PartySmallWindowAdd.parse(payload)
+        if pkt.member and pkt.member.object_id:
+            self.world.on_party_small_window_add(pkt.member)
+            log.info(
+                "[World] PartySmallWindowAdd: %s oid=0x%X HP %d/%d MP %d/%d",
+                pkt.member.name,
+                pkt.member.object_id,
+                pkt.member.cur_hp,
+                pkt.member.max_hp,
+                pkt.member.cur_mp,
+                pkt.member.max_mp,
+            )
+
+    def _on_party_small_window_delete(self, payload: bytes) -> None:
+        pkt = PartySmallWindowDelete.parse(payload)
+        if pkt.object_id:
+            self.world.on_party_small_window_delete(pkt.object_id)
+            log.info("[World] PartySmallWindowDelete: oid=0x%X", pkt.object_id)
+
+    def _on_short_buff_status_update(self, payload: bytes) -> None:
+        pkt = ShortBuffStatusUpdate.parse(payload)
+        if pkt.skill_id <= 0:
+            return
+        self.world.on_short_buff_status_update(pkt.skill_id, pkt_object_id=pkt.object_id)
+        log.debug(
+            "[World] ShortBuff skillId=%d objId=0x%X",
+            pkt.skill_id,
+            pkt.object_id,
+        )
+
     def set_combat_profile(self, profile: CombatProfile) -> None:
         self._combat_profile = profile
         self._rule_last_fire.clear()
         self._c2s_target_cancel_payload = normalize_target_cancel_payload(profile.target_cancel_payload)
         self._magic_skill_combat = normalize_magic_skill_payload(profile.magic_skill_payload)
+        self._combat_skill_packet = normalize_buff_skill_packet(profile.combat_skill_packet)
+        self._maybe_warn_combat_magic_payload_mismatch()
+        if profile.move_before_targeting and not self._move_before_target_warned:
+            self._move_before_target_warned = True
+            log.warning(
+                "[AutoCombat] move_before_targeting is set but pathing is not implemented — ignored",
+            )
 
     def set_buff_profile(self, profile: BuffProfile) -> None:
         self._buff_profile = profile
@@ -484,15 +640,35 @@ class BotEngine:
         self._buff_cast_times.clear()
         self._magic_skill_buff = normalize_magic_skill_payload(profile.magic_skill_payload)
         self._buff_skill_packet = normalize_buff_skill_packet(profile.buff_skill_packet)
+        self._maybe_warn_combat_magic_payload_mismatch()
         self._log_buff_profile_loaded("apply")
 
+    def _maybe_warn_combat_magic_payload_mismatch(self) -> None:
+        """dcb vs ddd on 0x39 desyncs many Teon/L2J servers → kick on Spoil/Sweep."""
+        if self._combat_skill_packet != "39":
+            return
+        c = self._magic_skill_combat
+        b = self._magic_skill_buff
+        if c == b:
+            return
+        log.warning(
+            "[AutoCombat] Combat 0x39 body is %s but buff profile uses %s — if you disconnect on "
+            "auto rules / post-kill sweep, set the same «0x39 body» on Auto combat as on Buffs, "
+            "or set Combat skill packet to 2f (shortcut bar).",
+            c,
+            b,
+        )
+
     def _log_buff_profile_loaded(self, reason: str) -> None:
-        path = default_buff_profile_path()
-        exists = path.is_file()
+        char = self._disk_profile_key
+        p, _ = resolve_buff_profile_read_path(
+            character_name=char if char is not None else None,
+        )
+        exists = p.is_file()
         log.info(
             "[BuffProfile] %s file=%s exists=%s buff_packet=0x%s magic_skill_payload=%s rules=%d",
             reason,
-            path,
+            p,
             exists,
             self._buff_skill_packet,
             self._magic_skill_buff,
@@ -534,6 +710,8 @@ class BotEngine:
             return False
         if self._combat_phase == "in_kill_loop":
             return True
+        if self._combat_phase == "recovering":
+            return True
         if self._hostile_target_alive():
             return True
         return False
@@ -552,6 +730,10 @@ class BotEngine:
         if prof.never_sit_while_target and self._hostile_target_alive():
             log.info("[AutoCombat] Skip post-kill sit: hostile target still selected")
             return False
+        tw = max(prof.incoming_damage_sit_block_sec, prof.aggro_retarget_window_sec)
+        if self.world.any_living_attacker_threatens_me(window_sec=tw):
+            log.info("[AutoCombat] Skip post-kill sit: attacker threat (recent hit / skill on you)")
+            return False
         gate = prof.incoming_damage_sit_block_sec
         if gate > 0 and (time.monotonic() - self._last_incoming_damage_mono) < gate:
             log.info(
@@ -560,6 +742,20 @@ class BotEngine:
             )
             return False
         return True
+
+    def _allow_idle_combat_sit(self) -> bool:
+        prof = self._combat_profile
+        if self.world.any_living_attacker_threatens_me(window_sec=prof.aggro_retarget_window_sec):
+            return False
+        if self._hostile_target_alive():
+            return False
+        return True
+
+    def _combat_anchor_args(self) -> tuple[tuple[int, int, int] | None, float]:
+        prof = self._combat_profile
+        if not prof.combat_anchor_leash_enabled or self._combat_anchor is None:
+            return (None, 0.0)
+        return (self._combat_anchor, max(1.0, prof.combat_anchor_leash_radius))
 
     def _record_buff_cast(self) -> None:
         now = time.monotonic()
@@ -655,7 +851,13 @@ class BotEngine:
                     # Self: merge Abnormal + MagicSkillLaunched / SkillList (Teon often omits toggles in Abnormal).
                     buff_present = self._self_rebuff_buff_presence(match_set, effects)
                 elif self.world.abnormal_reported_for_object(target_oid):
-                    buff_present = bool(effects & match_set)
+                    flags = [self.world.abnormal_buff_active(target_oid, s) for s in match_set]
+                    if any(f is True for f in flags):
+                        buff_present = True
+                    elif match_set and all(f is False for f in flags):
+                        buff_present = False
+                    else:
+                        buff_present = bool(effects & match_set)
                 else:
                     buff_present = None
                 need_cast = self._buff_need_cast(
@@ -756,7 +958,12 @@ class BotEngine:
             return True
         return wn.looks_eliminated()
 
-    async def _maybe_combat_rules(self, mob: Optional[Npc]) -> None:
+    async def _maybe_combat_rules(
+        self,
+        mob: Optional[Npc],
+        *,
+        opening_only: bool = False,
+    ) -> None:
         prof = self._combat_profile
         if not prof.rules:
             return
@@ -764,6 +971,8 @@ class BotEngine:
         in_combat = mob is not None
         now = time.monotonic()
         for idx, rule in enumerate(prof.rules):
+            if opening_only and not rule.fire_before_first_attack:
+                continue
             if rule.only_in_combat and not in_combat:
                 continue
             if rule.hp_below_pct > 0:
@@ -783,8 +992,25 @@ class BotEngine:
                 if now - last < rule.cooldown_sec:
                     continue
             if rule.rebuff_missing_skill_id > 0:
-                if rule.rebuff_missing_skill_id in self.world.abnormal_buff_skill_ids:
+                sid = rule.rebuff_missing_skill_id
+                oid = self.world.me.object_id
+                st = self.world.abnormal_buff_active(oid, sid) if oid else None
+                if st is True:
                     continue
+                if st is None and sid in self.world.abnormal_buff_skill_ids:
+                    continue
+            if mob is not None:
+                teff = self.world.abnormal_skill_ids_for_object(mob.object_id)
+                if rule.require_target_missing_abnormal_ids:
+                    miss = set(rule.require_target_missing_abnormal_ids)
+                    if miss & teff:
+                        continue
+                if rule.require_target_has_abnormal_ids:
+                    need = set(rule.require_target_has_abnormal_ids)
+                    if not (need & teff):
+                        continue
+            elif rule.require_target_missing_abnormal_ids or rule.require_target_has_abnormal_ids:
+                continue
             if rule.kind == "skill" and rule.skill_id > 0:
                 if rule.skill_id in self.world.passive_skill_ids:
                     log.debug(
@@ -803,9 +1029,20 @@ class BotEngine:
                         idx, rule.skill_id,
                     )
                     continue
+                gap = max(0.0, prof.combat_skill_min_interval_sec)
+                if gap > 0:
+                    last_s = self._combat_skill_last_cast.get(rule.skill_id, 0.0)
+                    if now - last_s < gap:
+                        continue
                 self.use_skill(rule.skill_id)
+                self._combat_skill_last_cast[rule.skill_id] = now
                 self._rule_last_fire[idx] = now
-                log.info("[AutoCombat] Rule #%d skillId=%d", idx, rule.skill_id)
+                log.info(
+                    "[AutoCombat] Rule #%d skillId=%d%s",
+                    idx,
+                    rule.skill_id,
+                    " (opening)" if opening_only else "",
+                )
                 await asyncio.sleep(prof.post_skill_delay)
                 return
             if rule.kind == "item" and rule.item_id > 0:
@@ -818,9 +1055,26 @@ class BotEngine:
                     continue
                 self.use_item(oid)
                 self._rule_last_fire[idx] = now
-                log.info("[AutoCombat] Rule #%d useItem objId=0x%X template=%d", idx, oid, rule.item_id)
+                log.info(
+                    "[AutoCombat] Rule #%d useItem objId=0x%X template=%d%s",
+                    idx,
+                    oid,
+                    rule.item_id,
+                    " (opening)" if opening_only else "",
+                )
                 await asyncio.sleep(prof.post_skill_delay)
                 return
+
+    async def _ensure_standing_before_combat(self) -> None:
+        """After post-kill / idle sit regen, stand before targeting (attack while sitting fails)."""
+        me = self.world.me
+        if me.me_sitting is not True:
+            return
+        log.info("[AutoCombat] Standing before engage (still sitting)")
+        await self._ensure_standing_after_recovery()
+        await asyncio.sleep(
+            max(0.08, min(0.6, self._combat_profile.post_kill_recovery_after_stand_sec))
+        )
 
     # ------------------------------------------------------------------ #
     # Auto-combat
@@ -832,6 +1086,9 @@ class BotEngine:
             self.stop_auto_combat()
         self._auto_combat = True
         self._combat_range = combat_range
+        me = self.world.me
+        self._combat_anchor = (me.x, me.y, me.z) if me.object_id else None
+        self._no_mob_anchor_since = None
         self._auto_task = asyncio.ensure_future(self._auto_combat_loop())
         log.info("[BotEngine] Auto-combat started (range=%.0f)", combat_range)
 
@@ -839,10 +1096,39 @@ class BotEngine:
         """Stop auto-combat loop."""
         self._auto_combat = False
         self._combat_phase = "idle"
+        self._auto_combat_last_target_oid = 0
+        self._combat_anchor = None
+        self._no_mob_anchor_since = None
         if self._auto_task and not self._auto_task.done():
             self._auto_task.cancel()
         self._auto_task = None
         log.info("[BotEngine] Auto-combat stopped")
+
+    def get_combat_diagnostics(self) -> dict[str, object]:
+        """Safe snapshot for UI (main thread); no asyncio wait."""
+        tid = self.world.me.target_id
+        n = self.world.npcs.get(tid) if tid else None
+        target_lbl = ""
+        if n and n.is_attackable:
+            target_lbl = (
+                f"npcId={n.npc_id} oid=0x{tid:X} d={self.world.dist_to(n):.0f}"
+            )
+        elif tid:
+            target_lbl = f"oid=0x{tid:X}"
+        me = self.world.me
+        sit = me.me_sitting
+        sit_s = "?" if sit is None else ("sit" if sit else "stand")
+        return {
+            "phase": self._combat_phase,
+            "auto_combat": self._auto_combat,
+            "target": target_lbl,
+            "sitting": sit_s,
+            "cur_cp": me.cur_cp,
+            "max_cp": me.max_cp,
+            "buff_rules": len(self._buff_profile.rules) if self._buff_profile else 0,
+            "combat_rules": len(self._combat_profile.rules),
+            "anchor": self._combat_anchor,
+        }
 
     async def _auto_combat_loop(self) -> None:
         log.info("[BotEngine] Auto-combat loop running")
@@ -857,30 +1143,69 @@ class BotEngine:
                 # Always loot any nearby items first (from previous kills etc)
                 if prof.auto_loot:
                     items_around = self.world.get_items_in_range(prof.loot_range)
+                    if (
+                        prof.loot_respect_anchor_leash
+                        and prof.combat_anchor_leash_enabled
+                        and self._combat_anchor is not None
+                    ):
+                        ax, ay, az = self._combat_anchor
+                        lr = max(1.0, prof.combat_anchor_leash_radius)
+                        items_around = [
+                            it for it in items_around
+                            if World.dist_xyz(ax, ay, az, it.x, it.y, it.z) <= lr
+                        ]
                     if items_around:
                         looted = await self.loot_nearby_async(
                             prof.loot_range,
-                            rounds=2,
-                            max_attempts=10,
+                            max_attempts=56,
                             delay_sec=max(0.05, prof.idle_loot_item_delay_sec),
+                            empty_polls_to_stop=5,
                         )
                         log.info("[AutoCombat] Loot: %d pickup attempts", looted)
                         if looted:
                             await asyncio.sleep(max(0.05, prof.open_combat_pre_loot_sleep_sec))
 
-                mob = self.world.get_nearest_mob(self._combat_range)
+                never = frozenset(prof.never_attack_object_ids) | frozenset(
+                    prof.party_protect_object_ids
+                )
+                wl = frozenset(prof.npc_whitelist_ids)
+                bl = frozenset(prof.npc_blacklist_ids)
+                anchor_xyz, anchor_r = self._combat_anchor_args()
+                mob = self.world.pick_auto_combat_target(
+                    self._combat_range,
+                    prefer_aggro=prof.prefer_aggro_mobs,
+                    retain_target_oid=self._auto_combat_last_target_oid,
+                    retain_max_dist=max(0.0, prof.retain_current_target_max_dist),
+                    npc_blacklist=bl,
+                    attack_only_whitelist=prof.attack_only_whitelist_mobs,
+                    npc_whitelist=wl,
+                    target_z_range_max=max(0.0, prof.target_z_range_max),
+                    skip_summoned=prof.skip_summoned_npcs,
+                    never_attack_oids=never,
+                    anchor_xyz=anchor_xyz,
+                    anchor_leash_radius=anchor_r,
+                )
                 if mob:
+                    self._no_mob_anchor_since = None
                     # Always resolve by objectId — NpcInfo replaces dict entries, stale mob refs never update.
                     target_oid = mob.object_id
+                    self._auto_combat_last_target_oid = target_oid
                     log.info("[AutoCombat] Target: npcId=%d '%s' objId=0x%X dist=%.0f hp=%.0f%%",
                              mob.npc_id, mob.name or mob.title or '?',
                              target_oid, self.world.dist_to(mob), mob.hp_pct)
+                    await self._ensure_standing_before_combat()
+                    if not self._auto_combat:
+                        return
                     # Step 1: Target the mob via Action (0x04)
                     self.attack(target_oid)
                     await asyncio.sleep(self._combat_profile.post_target_delay)
                     if not self._auto_combat:
                         return
-                    await self._maybe_combat_rules(self.world.npcs.get(target_oid))
+                    wm = self.world.npcs.get(target_oid)
+                    await self._maybe_combat_rules(wm, opening_only=True)
+                    if not self._auto_combat:
+                        return
+                    await self._maybe_combat_rules(wm, opening_only=False)
                     if not self._auto_combat:
                         return
                     # Step 2: Attack via 0x2F actionId=16 (real client attack)
@@ -891,6 +1216,8 @@ class BotEngine:
                     reattack_sleep = max(0.05, prof.reattack_action_sleep_sec)
                     t0 = time.monotonic()
                     last_reattack = t0
+                    last_rules_tick = t0
+                    rules_iv = max(0.0, prof.combat_rules_tick_sec)
                     self._combat_phase = "in_kill_loop"
                     try:
                         while self._auto_combat:
@@ -906,11 +1233,49 @@ class BotEngine:
                                     "giving up this target (NpcInfo/Die may be missing)",
                                     kill_max_sec,
                                 )
+                                self._auto_combat_last_target_oid = 0
                                 break
                             now = time.monotonic()
+                            if prof.retarget_to_aggro_enabled and not self.world.is_npc_attacking_me(
+                                target_oid, window_sec=prof.aggro_retarget_window_sec
+                            ):
+                                alt = self.world.nearest_aggro_npc_except(
+                                    target_oid,
+                                    self._combat_range,
+                                    target_z_range_max=max(0.0, prof.target_z_range_max),
+                                    npc_blacklist=bl,
+                                    attack_only_whitelist=prof.attack_only_whitelist_mobs,
+                                    npc_whitelist=wl,
+                                    skip_summoned=prof.skip_summoned_npcs,
+                                    never_attack_oids=never,
+                                    aggro_window_sec=prof.aggro_retarget_window_sec,
+                                    anchor_xyz=anchor_xyz,
+                                    anchor_leash_radius=anchor_r,
+                                )
+                                if alt is not None:
+                                    log.info(
+                                        "[AutoCombat] Retarget to aggro npc objId=0x%X (was 0x%X)",
+                                        alt.object_id,
+                                        target_oid,
+                                    )
+                                    target_oid = alt.object_id
+                                    self._auto_combat_last_target_oid = target_oid
+                                    t0 = time.monotonic()
+                                    self.attack(target_oid)
+                                    await asyncio.sleep(reattack_sleep)
+                                    wn = self.world.npcs.get(target_oid)
+                                    await self._maybe_combat_rules(wn, opening_only=True)
+                                    await self._maybe_combat_rules(wn, opening_only=False)
+                                    self.force_attack()
+                                    last_reattack = time.monotonic()
+                                    last_rules_tick = time.monotonic()
+                            if rules_iv > 0 and (now - last_rules_tick) >= rules_iv:
+                                await self._maybe_combat_rules(self.world.npcs.get(target_oid))
+                                last_rules_tick = time.monotonic()
                             if now - last_reattack >= reattack_sec:
                                 if not self._npc_fightable(target_oid):
                                     log.info("[AutoCombat] Target no longer fightable — stop re-attacking")
+                                    self._auto_combat_last_target_oid = 0
                                     break
                                 self.attack(target_oid)
                                 await asyncio.sleep(reattack_sleep)
@@ -920,6 +1285,15 @@ class BotEngine:
                             await asyncio.sleep(kill_tick)
                     finally:
                         self._combat_phase = "idle"
+                    if (
+                        prof.post_kill_sweep_enabled
+                        and prof.post_kill_sweep_skill_id > 0
+                        and self.world.is_skill_ready(prof.post_kill_sweep_skill_id)
+                    ):
+                        self.target_object(target_oid)
+                        await asyncio.sleep(max(0.05, prof.post_kill_sweep_delay_sec))
+                        self.use_skill(prof.post_kill_sweep_skill_id)
+                        await asyncio.sleep(max(0.05, prof.post_skill_delay))
                     # Drop target so we do not stay glued to a corpse if HP/death packets lag.
                     self.cancel_target()
                     # Auto-loot after kill — wait for drop packets, then pick up
@@ -927,9 +1301,9 @@ class BotEngine:
                         await asyncio.sleep(max(0.05, prof.post_kill_spawn_wait_sec))
                         looted = await self.loot_nearby_async(
                             prof.loot_range,
-                            rounds=2,
-                            max_attempts=12,
+                            max_attempts=80,
                             delay_sec=max(0.05, prof.post_kill_loot_item_delay_sec),
+                            empty_polls_to_stop=6,
                         )
                         if looted:
                             log.info("[AutoCombat] Post-kill loot: %d pickup attempts", looted)
@@ -967,9 +1341,9 @@ class BotEngine:
                     if prof.auto_loot:
                         looted = await self.loot_nearby_async(
                             prof.loot_range,
-                            rounds=2,
-                            max_attempts=8,
+                            max_attempts=48,
                             delay_sec=max(0.05, prof.idle_loot_item_delay_sec),
+                            empty_polls_to_stop=5,
                         )
                         if looted:
                             log.info("[AutoCombat] Idle loot: %d pickup attempts", looted)
@@ -978,6 +1352,33 @@ class BotEngine:
                               if n.is_attackable and not n.is_dead)
                     log.info("[AutoCombat] No mobs in range (world_npcs=%d, attackable=%d, range=%.0f)",
                              total, atk, self._combat_range)
+                    self._auto_combat_last_target_oid = 0
+                    me = self.world.me
+                    if prof.combat_anchor_reset_idle_sec > 0 and me.object_id:
+                        nma = time.monotonic()
+                        if self._no_mob_anchor_since is None:
+                            self._no_mob_anchor_since = nma
+                        elif (nma - self._no_mob_anchor_since) >= prof.combat_anchor_reset_idle_sec:
+                            self._combat_anchor = (me.x, me.y, me.z)
+                            self._no_mob_anchor_since = nma
+                            log.info(
+                                "[AutoCombat] Combat anchor recentered after %.0fs idle",
+                                prof.combat_anchor_reset_idle_sec,
+                            )
+                    if prof.combat_sit_while_idle_enabled and self._allow_idle_combat_sit():
+                        me = self.world.me
+                        if me.effective_max_hp() > 0 and me.hp_pct_safe < prof.combat_sit_hp_below_pct:
+                            self._combat_phase = "recovering"
+                            self._recovery_sent_sit_toggle = False
+                            try:
+                                await self._ensure_sitting_for_recovery()
+                                try:
+                                    await self._wait_recovery(prof.combat_stand_hp_pct)
+                                finally:
+                                    await self._ensure_standing_after_recovery()
+                            finally:
+                                self._recovery_sent_sit_toggle = False
+                                self._combat_phase = "idle"
                     await asyncio.sleep(max(0.2, prof.idle_no_mobs_sleep_sec))
             except asyncio.CancelledError:
                 break
@@ -1034,15 +1435,19 @@ class BotEngine:
         *,
         for_buff: bool = False,
     ) -> None:
-        """Use a skill by ID. Combat: 0x39 + CombatProfile layout. Buff: BuffProfile buff_skill_packet (0x39 or 0x2F Teon)."""
-        if for_buff and self._buff_skill_packet == "2f":
+        """Use a skill by ID. Combat: 0x39 or 0x2F (Teon bar). Buff: BuffProfile buff_skill_packet."""
+        use_2f = (for_buff and self._buff_skill_packet == "2f") or (
+            not for_buff and self._combat_skill_packet == "2f"
+        )
+        if use_2f:
             opcode, payload = cs.build_shortcut_skill_use(skill_id, ctrl, shift)
             self.game_proxy.inject_to_server(opcode, payload)
             log.info(
-                "[Bot] UseSkill → skillId=%d 0x2F len=%d hex=%s (buff shortcut)",
+                "[Bot] UseSkill → skillId=%d 0x2F len=%d hex=%s (%s)",
                 skill_id,
                 len(payload),
                 payload.hex(),
+                "buff" if for_buff else "combat",
             )
             return
         style = self._magic_skill_buff if for_buff else self._magic_skill_combat
@@ -1084,52 +1489,113 @@ class BotEngine:
         await asyncio.sleep(_RECOVERY_TOGGLE_ACK_SEC)
 
     async def _ensure_standing_after_recovery(self) -> None:
-        """Undo sit after regen: use server sit flag when known, else undo our single recovery toggle."""
-        me = self.world.me
-        need_toggle = False
-        if me.me_sitting is True:
-            need_toggle = True
-        elif me.me_sitting is None and self._recovery_sent_sit_toggle:
-            need_toggle = True
-        if not need_toggle:
-            return
-        self.sit_stand()
-        await asyncio.sleep(_RECOVERY_TOGGLE_ACK_SEC)
+        """Undo sit after regen: one or more RequestActionUse(0) toggles until server says standing.
 
-    def pickup(self, item_object_id: int) -> None:
+        MoveToPoint sync can clear me_sitting falsely; ChangeWaitType can lag — retries help."""
+        me = self.world.me
+        if not (me.me_sitting is True or self._recovery_sent_sit_toggle):
+            return
+        prof = self._combat_profile
+        attempts = max(1, min(4, int(prof.recovery_stand_toggle_attempts)))
+        for i in range(attempts):
+            if not self._auto_combat:
+                break
+            self.sit_stand()
+            await asyncio.sleep(_RECOVERY_TOGGLE_ACK_SEC)
+            me = self.world.me
+            # Only stop when server reports standing; None = unknown — keep toggling (was: «not True» exited too early).
+            if me.me_sitting is False:
+                return
+        log.warning(
+            "[AutoCombat] Still sitting after %d stand toggle(s) — try flipping "
+            "recovery_change_wait_type_sit_raw (0↔1) in autocombat.json; see docs/recovery-sit-stand.md",
+            attempts,
+        )
+
+    def pickup(self, item_object_id: int, *, quiet: bool = False) -> None:
         """Pick up item on ground by right-clicking it (CS_Action 0x04).
         This is how the real client picks up items — NOT via 0x48."""
+        sess = self.game_proxy.session
+        if not sess.crypto_initialized or not sess.xor_c2s_server:
+            return
         me = self.world.me
         opcode, payload = cs.build_action(item_object_id, me.x, me.y, me.z)
         self.game_proxy.inject_to_server(opcode, payload)
-        log.info("[Bot] Pickup (Action) → objectId=0x%X from=(%d,%d,%d)",
-                 item_object_id, me.x, me.y, me.z)
+        if quiet:
+            log.debug(
+                "[Bot] Pickup (Action) → objectId=0x%X from=(%d,%d,%d)",
+                item_object_id,
+                me.x,
+                me.y,
+                me.z,
+            )
+        else:
+            log.info(
+                "[Bot] Pickup (Action) → objectId=0x%X from=(%d,%d,%d)",
+                item_object_id,
+                me.x,
+                me.y,
+                me.z,
+            )
 
     async def loot_nearby_async(
         self,
         max_dist: float = 800.0,
-        rounds: int = 4,
         *,
-        max_attempts: int = 24,
+        max_attempts: int = 64,
         delay_sec: float = 0.28,
+        empty_polls_to_stop: int = 4,
+        max_pickup_tries_per_object: int = 4,
     ) -> int:
-        """Pick up ground items via CS_Action. Multi-pass for late drops.
-        Caps attempts so stale objectIds in world do not burn seconds per item."""
+        """Pick up ground items via CS_Action. One closest item per iteration; stale oids dropped."""
         picked = 0
         cap = max(1, max_attempts)
         pause = max(0.05, delay_sec)
-        for _ in range(max(1, rounds)):
+        empty = 0
+        max_empty = max(2, empty_polls_to_stop)
+        per_oid_tries: dict[int, int] = {}
+        max_oid = max(1, max_pickup_tries_per_object)
+        while picked < cap:
+            sess = self.game_proxy.session
+            if not sess.crypto_initialized:
+                log.info("[AutoCombat] Loot stopped — game session disconnected")
+                break
             items = self.world.get_items_in_range(max_dist)
+            prof = self._combat_profile
+            if (
+                prof.loot_respect_anchor_leash
+                and prof.combat_anchor_leash_enabled
+                and self._combat_anchor is not None
+            ):
+                ax, ay, az = self._combat_anchor
+                lr = max(1.0, prof.combat_anchor_leash_radius)
+                items = [
+                    it for it in items
+                    if World.dist_xyz(ax, ay, az, it.x, it.y, it.z) <= lr
+                ]
             if not items:
+                empty += 1
+                if empty >= max_empty:
+                    break
                 await asyncio.sleep(0.12)
                 continue
-            for item in items:
-                if picked >= cap:
-                    return picked
-                self.pickup(item.object_id)
-                picked += 1
-                await asyncio.sleep(pause)
-            await asyncio.sleep(0.12)
+            empty = 0
+            item = items[0]
+            oid = item.object_id
+            tries = per_oid_tries.get(oid, 0)
+            if tries >= max_oid:
+                self.world.ground_items.pop(oid, None)
+                per_oid_tries.pop(oid, None)
+                log.warning(
+                    "[AutoCombat] Removed stale ground item objId=0x%X after %d pickup tries",
+                    oid,
+                    max_oid,
+                )
+                continue
+            self.pickup(oid, quiet=True)
+            picked += 1
+            per_oid_tries[oid] = tries + 1
+            await asyncio.sleep(pause)
         return picked
 
     def loot_nearby(self, max_dist: float = 800.0) -> int:
@@ -1149,8 +1615,14 @@ class BotEngine:
             await asyncio.sleep(1.0)
             if not self._auto_combat:
                 return
+            prof = self._combat_profile
+            if self.world.any_living_attacker_threatens_me(
+                window_sec=max(prof.incoming_damage_sit_block_sec, prof.aggro_retarget_window_sec)
+            ):
+                log.info("[AutoCombat] Recovery interrupted — under attack")
+                return
             me = self.world.me
-            hp_ok = me.hp_pct_safe >= target_hp_pct
+            hp_ok = me.hp_recovery_reached(target_hp_pct)
             mp_ok = (
                 not mp_gate
                 or me.effective_max_mp() <= 0
@@ -1158,8 +1630,10 @@ class BotEngine:
             )
             if hp_ok and mp_ok:
                 log.info(
-                    "[AutoCombat] Recovery done — HP=%.0f%% MP=%.0f%% — resuming",
+                    "[AutoCombat] Recovery done — HP=%.0f%% (cur=%d baseline_max=%d) MP=%.0f%% — resuming",
                     me.hp_pct_safe,
+                    me.cur_hp,
+                    me.max_hp_baseline,
                     me.mp_pct_safe,
                 )
                 return

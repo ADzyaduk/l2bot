@@ -18,7 +18,7 @@ Game Server packet framing:
 import asyncio
 import logging
 import struct
-from typing import Callable, Awaitable
+from typing import Awaitable, Callable
 
 # Logged at INFO without enabling full packet DEBUG (see _handle_client_to_server).
 _C2S_INFO_PLAIN_OPCODES = frozenset({
@@ -64,9 +64,15 @@ class _GameRelayProtocol(asyncio.Protocol):
     direction: "c2s" (client to server) or "s2c" (server to client)
     """
 
-    def __init__(self, session: GameSession, direction: str):
+    def __init__(
+        self,
+        session: GameSession,
+        direction: str,
+        on_disconnect: Callable[[], None] | None = None,
+    ):
         self._session = session
         self._direction = direction
+        self._on_disconnect = on_disconnect
         self._transport: asyncio.Transport | None = None
         self._buf = bytearray()
         self._peer: "_GameRelayProtocol | None" = None
@@ -150,6 +156,11 @@ class _GameRelayProtocol(asyncio.Protocol):
             pktlog.info(
                 "[S→C]%s0x%02X %s (%d bytes payload)", tag, opcode, name, len(payload),
             )
+
+        try:
+            sess.packet_trace.append(("S2C", opcode, name, plain.hex()))
+        except Exception:
+            pass
 
         if opcode == GS_CRYPT_INIT:
             self._handle_crypt_init(payload)
@@ -246,6 +257,10 @@ class _GameRelayProtocol(asyncio.Protocol):
                     "[C→S] 0x%02X %s (%d bytes) plain=%s",
                     opcode, name, len(payload), plain.hex(),
                 )
+            try:
+                sess.packet_trace.append(("C2S", opcode, name, plain.hex()))
+            except Exception:
+                pass
         else:
             # Before crypto init — forward transparently
             if self._peer and self._peer._transport:
@@ -257,7 +272,7 @@ class _GameRelayProtocol(asyncio.Protocol):
         decrypt state.  Client packets are re-encrypted through the same cipher."""
         sess = self._session
         if not sess.crypto_initialized or not sess.xor_c2s_server:
-            log.warning("[GameProxy] Cannot inject packet — crypto not initialized yet")
+            log.debug("[GameProxy] Skip inject — crypto not ready (pre-init or disconnected)")
             return
         # Build plaintext body: opcode + payload (NO checksum for game server)
         # Checksums are only used by the login server protocol.
@@ -270,7 +285,11 @@ class _GameRelayProtocol(asyncio.Protocol):
         if self._peer and self._peer._transport and not self._peer._transport.is_closing():
             self._peer._transport.write(out)
             name = get_client_packet_name(opcode)
-            log.info("[BOT→S] 0x%02X %s injected (%d bytes) plain=%s", opcode, name, len(body), body.hex())
+            pktlog.info("[BOT→S] 0x%02X %s injected (%d bytes) plain=%s", opcode, name, len(body), body.hex())
+            try:
+                sess.packet_trace.append(("BOT", opcode, name, body.hex()))
+            except Exception:
+                pass
 
     def send_to_client(self, opcode: int, payload: bytes) -> None:
         """Inject a fake packet toward the L2 client (XOR-encrypted).
@@ -287,6 +306,8 @@ class _GameRelayProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         log.info("[GameProxy %s] Connection lost: %s", self._direction, exc)
+        if self._on_disconnect:
+            self._on_disconnect()
         if self._peer and self._peer._transport and not self._peer._transport.is_closing():
             self._peer._transport.close()
 
@@ -308,6 +329,8 @@ class GameProxyServer:
         self.on_server_packet: Callable[[int, bytes], Awaitable[None]] | None = None
         # Called when a new client connects (new game session started)
         self.on_new_session: Callable[[], None] | None = None
+        # Either relay leg closed — bot should stop injects / auto-combat (one-shot per connection)
+        self.on_game_connection_lost: Callable[[], None] | None = None
         # Active c2s protocol — used by bot to inject packets
         self._c2s_proto: _GameRelayProtocol | None = None
 
@@ -325,8 +348,24 @@ class GameProxyServer:
         # Create fresh session per client connection
         self.session = GameSession()
 
-        c2s = _GameRelayProtocol(self.session, "c2s")
-        s2c = _GameRelayProtocol(self.session, "s2c")
+        disconnect_notified = False
+
+        def notify_game_disconnect() -> None:
+            nonlocal disconnect_notified
+            if disconnect_notified:
+                return
+            disconnect_notified = True
+            self.session.crypto_initialized = False
+            self._c2s_proto = None
+            cb = self.on_game_connection_lost
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    log.exception("[GameProxy] on_game_connection_lost callback failed")
+
+        c2s = _GameRelayProtocol(self.session, "c2s", notify_game_disconnect)
+        s2c = _GameRelayProtocol(self.session, "s2c", notify_game_disconnect)
         c2s.set_peer(s2c)
 
         if self.on_server_packet:

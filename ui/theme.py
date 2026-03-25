@@ -15,16 +15,18 @@ COL_ACCENT_DIM = "#9a7a3a"
 COL_TEAL = "#3ecf9b"
 COL_TEXT = "#e6e2dc"
 COL_MUTED = "#8a9099"
+COL_HELP = "#a8b0bc"
 COL_WARN = "#e8b44d"
 COL_LOG_BG = "#080a0e"
 COL_LOG_FG = "#c5f5dc"
 COL_STATUS_BG = "#121824"
 
-FONT_TITLE = ("Trebuchet MS", 13, "bold")
+FONT_TITLE = ("Trebuchet MS", 14, "bold")
 FONT_SECTION = ("Trebuchet MS", 11, "bold")
 FONT_UI = ("Segoe UI", 10)
 FONT_SMALL = ("Segoe UI", 9)
-FONT_MONO = ("Consolas", 10)
+FONT_HELP = ("Segoe UI", 10)
+FONT_MONO = ("Consolas", 11)
 
 STYLE_PREFIX = "L2"
 
@@ -42,6 +44,8 @@ S_TREE = f"{STYLE_PREFIX}.Treeview"
 S_LF = f"{STYLE_PREFIX}.TLabelframe"
 S_SEP = f"{STYLE_PREFIX}.TSeparator"
 S_PROG = f"{STYLE_PREFIX}.Horizontal.TProgressbar"
+S_HELP = f"{STYLE_PREFIX}Help.TLabel"
+S_BTN_PRIMARY = f"{STYLE_PREFIX}Primary.TButton"
 
 
 def setup_ttk_styles(root: tk.Misc) -> ttk.Style:
@@ -56,6 +60,7 @@ def setup_ttk_styles(root: tk.Misc) -> ttk.Style:
     style.configure(f"{p}.TFrame", background=COL_PANEL)
     style.configure(f"{p}.TLabel", background=COL_PANEL, foreground=COL_TEXT, font=FONT_UI)
     style.configure(f"{p}Muted.TLabel", background=COL_PANEL, foreground=COL_MUTED, font=FONT_SMALL)
+    style.configure(f"{p}Help.TLabel", background=COL_PANEL, foreground=COL_HELP, font=FONT_HELP)
     style.configure(f"{p}Title.TLabel", background=COL_PANEL, foreground=COL_ACCENT, font=FONT_TITLE)
     style.configure(f"{p}Section.TLabel", background=COL_PANEL, foreground=COL_TEAL, font=FONT_SECTION)
 
@@ -95,6 +100,28 @@ def setup_ttk_styles(root: tk.Misc) -> ttk.Style:
             ("pressed", COL_TEXT),
             ("active", COL_TEXT),
             ("!disabled", COL_TEXT),
+        ],
+    )
+    style.configure(
+        f"{p}Primary.TButton",
+        background=COL_TEAL,
+        foreground=COL_LOG_BG,
+        font=("Segoe UI", 10, "bold"),
+        padding=(14, 6),
+        borderwidth=0,
+    )
+    style.map(
+        f"{p}Primary.TButton",
+        background=[
+            ("disabled", COL_RAIL),
+            ("pressed", "#2db88a"),
+            ("active", "#4dd4a8"),
+        ],
+        foreground=[
+            ("disabled", COL_MUTED),
+            ("pressed", COL_LOG_BG),
+            ("active", COL_LOG_BG),
+            ("!disabled", COL_LOG_BG),
         ],
     )
 
@@ -138,11 +165,17 @@ def setup_ttk_styles(root: tk.Misc) -> ttk.Style:
     style.configure(f"{p}.TEntry", fieldbackground=COL_LOG_BG, foreground=COL_TEXT)
     style.configure(f"{p}.Horizontal.TProgressbar", troughcolor=COL_RAIL, background=COL_TEAL)
 
-    style.configure(f"{p}.Treeview", background=COL_LOG_BG, foreground=COL_TEXT, fieldbackground=COL_LOG_BG, font=FONT_MONO, rowheight=22)
+    style.configure(f"{p}.Treeview", background=COL_LOG_BG, foreground=COL_TEXT, fieldbackground=COL_LOG_BG, font=FONT_MONO, rowheight=26)
     style.configure(f"{p}.Treeview.Heading", background=COL_RAIL, foreground=COL_ACCENT, font=FONT_UI)
     style.map(f"{p}.Treeview", background=[("selected", COL_ACCENT_DIM)])
 
-    style.configure(f"{p}.TLabelframe", background=COL_PANEL, foreground=COL_TEAL, font=FONT_SECTION)
+    style.configure(
+        f"{p}.TLabelframe",
+        background=COL_PANEL,
+        foreground=COL_TEAL,
+        font=FONT_SECTION,
+        labelmargins=(10, 4, 0, 6),
+    )
     style.configure(f"{p}.TLabelframe.Label", background=COL_PANEL, foreground=COL_TEAL, font=FONT_SECTION)
     style.configure(f"{p}.TSeparator", background=COL_RAIL)
 

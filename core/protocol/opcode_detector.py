@@ -54,6 +54,14 @@ TEON_BASE_OPCODES: dict[str, int] = {
     "MagicSkillLaunched": 0x48,
     # Active effect icons / buff list (L2J-style AbnormalStatusUpdate 0x7F)
     "AbnormalStatusUpdate": 0x7F,
+    # Party small window — HP/MP (L2J Interlude 0x4E–0x50)
+    "PartySmallWindowAll": 0x4E,
+    "PartySmallWindowAdd": 0x4F,
+    "PartySmallWindowDelete": 0x50,
+    # Party member buff list (L2J Interlude 0xEE)
+    "PartySpelled": 0xEE,
+    # Short buff icon strip (common L2J-style base 0x91; verify on capture if missing)
+    "ShortBuffStatusUpdate": 0x91,
     # Teon sends a SECOND StatusUpdate on base 0x0E (standard L2J StatusUpdate opcode).
     # Contains mob HP data (ATTR_MAX_HP, ATTR_CUR_HP). Same format as StatusUpdate.
     "StatusUpdate2":    0x0E,   # standard L2J StatusUpdate opcode — Teon uses it alongside 0x6D

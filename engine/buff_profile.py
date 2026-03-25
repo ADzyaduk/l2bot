@@ -1,6 +1,7 @@
 """
 Buff maintenance profile: periodic skill casts with optional AbnormalStatus check.
-Persisted as JSON (config/buffs.json).
+Persisted as JSON per character under config/characters/<slug>/buffs.json
+(fallback read: legacy config/buffs.json).
 """
 from __future__ import annotations
 
@@ -9,6 +10,12 @@ import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+
+from engine.character_config import (
+    legacy_buff_profile_path,
+    resolve_buff_profile_read_path,
+    resolve_buff_profile_write_path,
+)
 
 log = logging.getLogger(__name__)
 
@@ -184,12 +191,23 @@ class BuffProfile:
 
 
 def default_buff_profile_path(root: Path | None = None) -> Path:
-    base = root or Path(__file__).resolve().parents[1]
-    return base / "config" / "buffs.json"
+    """Legacy global file path."""
+    return legacy_buff_profile_path(root)
 
 
-def load_buff_profile(path: Path | None = None) -> BuffProfile:
-    p = path or default_buff_profile_path()
+def load_buff_profile(
+    path: Path | None = None,
+    *,
+    character_name: str | None = None,
+    root: Path | None = None,
+) -> BuffProfile:
+    r = root or Path(__file__).resolve().parents[1]
+    if path is not None:
+        p = path
+    elif character_name is None:
+        p = legacy_buff_profile_path(r)
+    else:
+        p, _ = resolve_buff_profile_read_path(character_name=character_name, root=r)
     if not p.is_file():
         return BuffProfile()
     try:
@@ -200,8 +218,18 @@ def load_buff_profile(path: Path | None = None) -> BuffProfile:
         return BuffProfile()
 
 
-def save_buff_profile(profile: BuffProfile, path: Path | None = None) -> None:
-    p = path or default_buff_profile_path()
+def save_buff_profile(
+    profile: BuffProfile,
+    path: Path | None = None,
+    *,
+    character_name: str | None = None,
+    root: Path | None = None,
+) -> None:
+    r = root or Path(__file__).resolve().parents[1]
+    if path is not None:
+        p = path
+    else:
+        p = resolve_buff_profile_write_path(character_name=character_name, root=r)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(profile.to_dict(), indent=2), encoding="utf-8")
     log.info("Saved buff profile: %s (%d rules)", p, len(profile.rules))

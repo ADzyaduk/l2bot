@@ -146,6 +146,8 @@ class L2BotApp:
             notebook.add(tab, text=f"  {title}  ")
 
         self.bot.log_tab = self._log_tab
+        self.bot.autocombat_tab = self._autocombat_tab
+        self.bot.on_character_profiles_changed = self._on_character_profiles_changed
         attach_ui_logging(self._log_tab)
 
         try:
@@ -157,19 +159,53 @@ class L2BotApp:
         except (OSError, ValueError, json.JSONDecodeError, tk.TclError):
             pass
 
+    def _on_character_profiles_changed(self) -> None:
+        """BotEngine may call from asyncio thread — marshal to Tk main thread."""
+        try:
+            self.root.after(0, self._do_character_profiles_changed)
+        except tk.TclError:
+            pass
+
+    def _do_character_profiles_changed(self) -> None:
+        for tab in (
+            getattr(self, "_autocombat_tab", None),
+            getattr(self, "_buffs_tab", None),
+        ):
+            if tab is not None and hasattr(tab, "refresh_profile_from_disk"):
+                tab.refresh_profile_from_disk()
+
     def _start_status_update(self) -> None:
         self._update_status()
 
     def _update_status(self) -> None:
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
         gp = getattr(self.bot, "game_proxy", None)
         gs = gp.session if gp else None
+        extra = ""
+        diag_cb = getattr(self.bot, "get_combat_diagnostics", None)
+        if callable(diag_cb):
+            d = diag_cb()
+            br = d.get("buff_rules", 0)
+            cr = d.get("combat_rules", 0)
+            extra = f"  |  rules: buffs={br} combat={cr}"
+            if d.get("auto_combat"):
+                ph = d.get("phase", "?")
+                tg = d.get("target") or "—"
+                extra += f"  |  combat: {ph}  {tg}"
         if gs and gs.crypto_initialized:
-            self._status_var.set("Connected — game proxy active")
+            self._status_var.set("Connected — game proxy active" + extra)
         elif self.bot.login_session.login_ok1:
             self._status_var.set("Authenticated — waiting for game connection")
         else:
             self._status_var.set("Waiting for client connection…")
-        self.root.after(1000, self._update_status)
+        try:
+            self.root.after(1000, self._update_status)
+        except tk.TclError:
+            pass
 
     def _on_close(self) -> None:
         self._save_ui_state()

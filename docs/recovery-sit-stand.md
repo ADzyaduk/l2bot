@@ -13,8 +13,10 @@ Another issue: if recovery **timed out** or you **stopped auto-combat** while `_
 1. **`SC_ChangeWaitType`** (Teon base opcode `0x25`, XOR-scrambled per session) is parsed and updates `World.me.me_sitting` for your object id when the second dword is a known pattern.
 2. **Before sitting for recovery** we skip the toggle if `me_sitting` is already `True`.
 3. **After recovery** (success, timeout, or combat stopped mid-wait) a `finally` block calls **`_ensure_standing_after_recovery`**, which toggles only if the server said we are sitting or we had sent a sit toggle with state still unknown.
-4. **`MoveToPoint` for self** sets `me_sitting = False` (you cannot walk while sitting).
+4. **`MoveToPoint` for self** clears `me_sitting` only when origin→destination delta is **≥ 64** units on any axis (tiny sync moves no longer fake «standing»).
 5. **New character / object id** from `UserInfo` resets `me_sitting` to standing (`False`).
+6. **After regen** the bot may send **up to N** stand toggles (`recovery_stand_toggle_attempts`, default **2**, max 4) until `me_sitting` is no longer true — helps laggy `ChangeWaitType` or one dropped toggle.
+7. Unmapped `wait_type` values for your character are logged at **DEBUG** (`ChangeWaitType self: unmapped wait_type=…`).
 
 ## Fork-specific: second dword meaning
 
@@ -23,14 +25,17 @@ Many Interlude private cores use **Acis-style** encoding: `0` = sitting, `1` = s
 In `config/autocombat.json` set:
 
 ```json
-"recovery_change_wait_type_sit_raw": 0
+"recovery_change_wait_type_sit_raw": 0,
+"recovery_stand_toggle_attempts": 2
 ```
 
-Use **`1`** if your server sends `1` when sitting (Mobius-like). The bot compares the packet’s second `int` to this value when it is only `0` or `1`. Larger enum values (`5`, `7`, etc.) are treated as sitting; `2`–`6` as not sitting.
+Use **`1`** for `recovery_change_wait_type_sit_raw` if your server sends `1` when sitting (Mobius-like). The bot compares the packet’s second `int` to this value when it is only `0` or `1`. Larger enum values (`5`, `7`, etc.) are treated as sitting; `2`–`6` as not sitting.
+
+Enable **DEBUG** logging for `engine.world` briefly if you need to see `unmapped wait_type` lines and extend `on_change_wait_type` for your shard.
 
 ## Timing
 
-After each toggle we wait **`_RECOVERY_TOGGLE_ACK_SEC` (0.4s)** in code so `ChangeWaitType` can arrive before the next toggle.
+After each toggle we wait **`_RECOVERY_TOGGLE_ACK_SEC` (0.5s)** in code so `ChangeWaitType` can arrive before the next toggle.
 
 ## This is not “broken decryption”
 

@@ -27,7 +27,9 @@ class CharacterTab:
             ("Level", "level"),
             ("HP", "hp"),
             ("MP", "mp"),
+            ("CP", "cp"),
             ("Pos", "pos"),
+            ("Auto state", "state"),
         ]):
             ttk.Label(grid, text=label + ":", style=theme.S_LABEL, width=8, anchor="e").grid(
                 row=row, column=0, sticky="e", pady=2, padx=(0, 8))
@@ -46,6 +48,38 @@ class CharacterTab:
         ttk.Label(bar_frame, text="MP", style=theme.S_LABEL, width=4, anchor="e").grid(row=1, column=0)
         self._mp_bar = ttk.Progressbar(bar_frame, length=360, maximum=100, style=theme.S_PROG)
         self._mp_bar.grid(row=1, column=1, padx=8, pady=2)
+
+        party_lf = ttk.LabelFrame(f, text="Party (HP / MP / CP + buff count from PartySpelled)", style=theme.S_LF)
+        party_lf.pack(fill=tk.BOTH, expand=True, padx=12, pady=(10, 6))
+        self._party_hint = tk.StringVar(
+            value="Not in party or waiting for PartySmallWindowAll from server…",
+        )
+        ttk.Label(party_lf, textvariable=self._party_hint, style=theme.S_LABEL_MUTED, wraplength=700).pack(
+            anchor="w", padx=8, pady=(6, 2))
+        pt = ttk.Frame(party_lf, style=theme.S_FRAME)
+        pt.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 6))
+        cols = ("hp", "mp", "cp", "buffs")
+        self._party_tree = ttk.Treeview(
+            pt,
+            columns=cols,
+            show="tree headings",
+            height=6,
+            style=theme.S_TREE,
+        )
+        self._party_tree.heading("#0", text="Name (Lv)")
+        self._party_tree.column("#0", width=160, stretch=True)
+        self._party_tree.heading("hp", text="HP")
+        self._party_tree.column("hp", width=120, stretch=False)
+        self._party_tree.heading("mp", text="MP")
+        self._party_tree.column("mp", width=120, stretch=False)
+        self._party_tree.heading("cp", text="CP")
+        self._party_tree.column("cp", width=100, stretch=False)
+        self._party_tree.heading("buffs", text="Buffs")
+        self._party_tree.column("buffs", width=52, stretch=False)
+        sy = ttk.Scrollbar(pt, orient=tk.VERTICAL, command=self._party_tree.yview)
+        self._party_tree.configure(yscrollcommand=sy.set)
+        self._party_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sy.pack(side=tk.RIGHT, fill=tk.Y)
 
         ttk.Separator(f, orient=tk.HORIZONTAL, style=theme.S_SEP).pack(fill=tk.X, padx=12, pady=10)
         ttk.Label(f, text="Combat", style=theme.S_SECTION).pack(pady=(0, 6), padx=12, anchor="w")
@@ -73,6 +107,10 @@ class CharacterTab:
         r = float(self._range_var.get())
         if self._combat_running:
             self._combat_btn_var.set("Stop auto-combat")
+            ac = getattr(self.bot, "autocombat_tab", None)
+            flush = getattr(ac, "flush_profile_to_engine", None)
+            if callable(flush):
+                flush()
             cb = getattr(self.bot, "start_auto_combat", None)
             if cb:
                 cb(r)
@@ -114,6 +152,49 @@ class CharacterTab:
             self._vars["hp"].set(f"{me.cur_hp} / {emx}")
             self._vars["mp"].set(f"{me.cur_mp} / {emn}")
             self._vars["pos"].set(f"({me.x}, {me.y}, {me.z})")
+            if me.max_cp > 0:
+                self._vars["cp"].set(f"{me.cur_cp} / {me.max_cp}")
+            elif me.cur_cp:
+                self._vars["cp"].set(str(me.cur_cp))
+            else:
+                self._vars["cp"].set("—")
             self._hp_bar["value"] = me.hp_pct_safe
             self._mp_bar["value"] = me.mp_pct_safe
-        self.frame.after(500, self._update)
+            diag_cb = getattr(self.bot, "get_combat_diagnostics", None)
+            if callable(diag_cb):
+                d = diag_cb()
+                ph = d.get("phase", "?")
+                st = d.get("sitting", "?")
+                tg = (d.get("target") or "—") if d.get("auto_combat") else "off"
+                self._vars["state"].set(f"{ph} | {st} | {tg}")
+            else:
+                self._vars["state"].set("—")
+        elif be:
+            self._vars["cp"].set("—")
+            self._vars["state"].set("—")
+        if be:
+            party = be.world.party_members
+            for iid in self._party_tree.get_children():
+                self._party_tree.delete(iid)
+            if not party:
+                self._party_hint.set(
+                    "Not in party or waiting for PartySmallWindowAll from server…",
+                )
+            else:
+                self._party_hint.set(
+                    "HP/MP/CP from party window + StatusUpdate; buff count from PartySpelled / Abnormal.",
+                )
+                for oid in sorted(party.keys(), key=lambda x: (party[x].name or "", x)):
+                    m = party[oid]
+                    label = f"{m.name or '?'} ({m.level})"
+                    if me and oid == me.object_id:
+                        label = f"{label}  [you]"
+                    hp_s = f"{m.cur_hp}/{m.max_hp}" if m.max_hp else str(m.cur_hp)
+                    mp_s = f"{m.cur_mp}/{m.max_mp}" if m.max_mp else str(m.cur_mp)
+                    if m.max_cp:
+                        cp_s = f"{m.cur_cp}/{m.max_cp}"
+                    else:
+                        cp_s = str(m.cur_cp) if m.cur_cp else "—"
+                    nb = len(be.world.abnormal_skill_ids_for_object(oid))
+                    self._party_tree.insert("", tk.END, text=label, values=(hp_s, mp_s, cp_s, str(nb)))
+        self.frame.after(400, self._update)

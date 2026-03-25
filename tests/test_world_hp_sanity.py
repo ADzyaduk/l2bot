@@ -61,6 +61,31 @@ def test_status_update_accepts_consistent_max_hp() -> None:
     assert w.me.max_hp == 200
 
 
+def test_status_update_rejects_huge_max_hp_keeps_sane_pct() -> None:
+    """Wrong ATTR_MAX_HP (huge) must not shrink hp_pct_safe or stick as me.max_hp."""
+    w = World()
+    oid = 0x300
+    w.on_user_info(_user_info(oid, cur_hp=176, max_hp=176, cur_mp=53, max_mp=53))
+
+    bad = StatusUpdate(
+        object_id=oid,
+        attrs={ATTR_CUR_HP: 176, ATTR_MAX_HP: 50_000},
+    )
+    w.on_status_update(bad)
+
+    assert w.me.max_hp == 176
+    assert abs(w.me.hp_pct_safe - 100.0) < 0.01
+
+
+def test_effective_max_ignores_stored_huge_max_hp() -> None:
+    """If a bogus max was stored earlier, effective_max must not use it for %."""
+    w = World()
+    oid = 0x301
+    w.on_user_info(_user_info(oid, 176, 176, 53, 53))
+    w.me.max_hp = 90_000
+    assert abs(w.me.hp_pct_safe - 100.0) < 0.01
+
+
 def test_mp_sanity_rejects_max_below_cur() -> None:
     w = World()
     oid = 3
@@ -71,3 +96,15 @@ def test_mp_sanity_rejects_max_below_cur() -> None:
 
     assert w.me.max_mp == 80
     assert w.me.mp_pct_safe <= 100.0
+
+
+def test_hp_recovery_reached_when_pct_skewed_but_cur_at_baseline() -> None:
+    """Inflated ATTR_MAX_HP makes hp_pct_safe low; bot recovery must still see full HP vs UserInfo."""
+    w = World()
+    oid = 0x400
+    w.on_user_info(_user_info(oid, cur_hp=176, max_hp=176, cur_mp=50, max_mp=50))
+    w.on_status_update(
+        StatusUpdate(object_id=oid, attrs={ATTR_CUR_HP: 176, ATTR_MAX_HP: 500})
+    )
+    assert w.me.hp_pct_safe < 50.0
+    assert w.me.hp_recovery_reached(80.0) is True

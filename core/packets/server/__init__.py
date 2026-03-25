@@ -6,6 +6,8 @@ using BasePacket cursor helpers.
 """
 import struct
 from dataclasses import dataclass, field
+from typing import Optional
+
 from core.protocol.base_packet import BasePacket
 
 
@@ -91,6 +93,7 @@ class NpcInfo:
     name: str = ""
     title: str = ""
     is_dead: bool = False     # isDead byte from packet
+    is_summoned: bool = False  # isSummoned byte (pets / summons — skip as combat targets when configured)
     hp_pct: float = 100.0     # 0-100, only for aggro monsters (unreliable on Teon)
 
     @property
@@ -131,7 +134,7 @@ class NpcInfo:
             p.read_byte()       # isRunning
             p.read_byte()       # inCombat
             self.is_dead = bool(p.read_byte())   # isDead
-            p.read_byte()       # isSummoned
+            self.is_summoned = bool(p.read_byte())  # isSummoned
             self.name = p.read_string()
             self.title = p.read_string()
             # After title: standard L2J Interlude NpcInfo remaining fields
@@ -770,6 +773,196 @@ class AbnormalStatusUpdate:
         if not opts:
             return AbnormalStatusUpdate()
         return max(opts, key=lambda x: x[0])[1]
+
+
+# ------------------------------------------------------------------ #
+# Party small window — HP/MP/CP bars (L2J Interlude base ~0x4E / 0x4F / 0x50)
+# ------------------------------------------------------------------ #
+@dataclass
+class PartyMemberInfo:
+    """One row from PartySmallWindowAll / PartySmallWindowAdd."""
+
+    object_id: int = 0
+    name: str = ""
+    class_id: int = 0
+    level: int = 0
+    cur_hp: int = 0
+    max_hp: int = 0
+    cur_mp: int = 0
+    max_mp: int = 0
+    cur_cp: int = 0
+    max_cp: int = 0
+
+
+def _parse_party_member_row(p: BasePacket) -> Optional[PartyMemberInfo]:
+    """L2J: S, objectId, classId, curHp, maxHp, curMp, maxMp, curCp, [maxCp,] level."""
+    try:
+        if p.remaining() < 4:
+            return None
+        name = p.read_string()
+        need = 6 * 4  # oid, class, hp×2, mp×2, curCp
+        if p.remaining() < need:
+            return None
+        oid = p.read_int()
+        class_id = p.read_int()
+        cur_hp = p.read_int()
+        max_hp = p.read_int()
+        cur_mp = p.read_int()
+        max_mp = p.read_int()
+        cur_cp = p.read_int()
+        max_cp = 0
+        level = 0
+        if p.remaining() >= 8:
+            max_cp = p.read_int()
+            level = p.read_int()
+        elif p.remaining() >= 4:
+            level = p.read_int()
+        else:
+            return None
+        return PartyMemberInfo(
+            object_id=oid,
+            name=name,
+            class_id=class_id,
+            level=level,
+            cur_hp=cur_hp,
+            max_hp=max_hp,
+            cur_mp=cur_mp,
+            max_mp=max_mp,
+            cur_cp=cur_cp,
+            max_cp=max_cp,
+        )
+    except Exception:
+        return None
+
+
+@dataclass
+class PartySmallWindowAll:
+    """Full party list (replaces local party state)."""
+
+    opcode = 0x4E
+    declared_count: int = -1
+    members: list[PartyMemberInfo] = field(default_factory=list)
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "PartySmallWindowAll":
+        self = cls()
+        if len(payload) < 4:
+            return self
+        p = BasePacket(payload)
+        try:
+            count = p.read_int()
+            self.declared_count = count
+            if count < 0 or count > 9:
+                return self
+            if count == 0:
+                return self
+            for _ in range(count):
+                m = _parse_party_member_row(p)
+                if m is None or m.object_id == 0:
+                    break
+                self.members.append(m)
+        except Exception:
+            pass
+        return self
+
+
+@dataclass
+class PartySmallWindowAdd:
+    opcode = 0x4F
+
+    member: Optional[PartyMemberInfo] = None
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "PartySmallWindowAdd":
+        self = cls()
+        p = BasePacket(payload)
+        self.member = _parse_party_member_row(p)
+        return self
+
+
+@dataclass
+class PartySmallWindowDelete:
+    opcode = 0x50
+
+    object_id: int = 0
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "PartySmallWindowDelete":
+        self = cls()
+        if len(payload) >= 4:
+            try:
+                self.object_id = struct.unpack_from("<i", payload, 0)[0]
+            except struct.error:
+                pass
+        return self
+
+
+# ------------------------------------------------------------------ #
+# SC_PartySpelled (L2J Interlude base ~0xEE) — buff list for one party member
+# ------------------------------------------------------------------ #
+@dataclass
+class PartySpelled:
+    object_id: int = 0
+    effects: list[tuple[int, int, int]] = field(default_factory=list)  # skill_id, level, duration
+
+    _EFFECT_STRIDE = 10
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "PartySpelled":
+        self = cls()
+        if len(payload) < 6:
+            return self
+        try:
+            oid = struct.unpack_from("<i", payload, 0)[0]
+            cnt = struct.unpack_from("<H", payload, 4)[0]
+            if oid == 0 or cnt <= 0 or cnt > 64:
+                return self
+            off = 6
+            effects: list[tuple[int, int, int]] = []
+            for _ in range(cnt):
+                if off + cls._EFFECT_STRIDE > len(payload):
+                    return self
+                sid, lvl, dur = struct.unpack_from("<ihI", payload, off)
+                if not _abnormal_skill_id_sane(sid):
+                    return cls()
+                effects.append((sid, lvl, dur))
+                off += cls._EFFECT_STRIDE
+            self.object_id = oid
+            self.effects = effects
+        except Exception:
+            pass
+        return self
+
+
+# ------------------------------------------------------------------ #
+# SC_ShortBuffStatusUpdate (L2J-style base ~0x91) — compact buff row(s)
+# ------------------------------------------------------------------ #
+@dataclass
+class ShortBuffStatusUpdate:
+    """Either 12B (skillId, skillLvl, duration as 3×DWORD) or 16B (+ leading objectId)."""
+
+    object_id: int = 0
+    skill_id: int = 0
+    skill_level: int = 0
+    duration: int = 0
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "ShortBuffStatusUpdate":
+        self = cls()
+        n = len(payload)
+        try:
+            if n >= 16:
+                self.object_id = struct.unpack_from("<i", payload, 0)[0]
+                self.skill_id = struct.unpack_from("<i", payload, 4)[0]
+                self.skill_level = struct.unpack_from("<i", payload, 8)[0]
+                self.duration = struct.unpack_from("<i", payload, 12)[0]
+            elif n >= 12:
+                self.skill_id = struct.unpack_from("<i", payload, 0)[0]
+                self.skill_level = struct.unpack_from("<i", payload, 4)[0]
+                self.duration = struct.unpack_from("<i", payload, 8)[0]
+        except Exception:
+            pass
+        return self
 
 
 # ------------------------------------------------------------------ #

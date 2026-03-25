@@ -79,13 +79,22 @@ python main.py
 - **`[proxy]`** — `listen_login_port`, `listen_game_port` — порты прослушивания на localhost.
 - **`[bot]`** — например `log_level`, `auto_start`.
 
-### `config/autocombat.json`
+### Профили авто-боя и баффов (по персонажу)
 
-Профиль **авто-боя** (`CombatProfile`): дистанция, лут, тайминги kill-loop, пороги HP/MP для сидения после убийства, опции пакетов (`target_cancel_payload`, `magic_skill_payload`), правила скиллов/предметов. Загрузка: `engine.combat_profile.load_profile`.
+После **UserInfo** (имя персонажа в мире) настройки читаются и сохраняются в каталоге:
 
-### `config/buffs.json`
+`config/characters/<slug>/autocombat.json` и `config/characters/<slug>/buffs.json`
 
-Профиль **баффов** (`BuffProfile`): очередь правил, стиль пакетов баффа (`buff_skill_packet` 0x39 vs 0x2F и т.д.). Загрузка: `engine.buff_profile.load_buff_profile`.
+(`slug` — безопасное имя из ника; пустое имя до входа → подпапка `_`).
+
+Пока файла для персонажа нет, используется **fallback** чтения из старых общих путей:
+
+- `config/autocombat.json` — профиль **авто-боя** (`CombatProfile`): дистанция, лут, тайминги kill-loop, пороги HP/MP, пакеты, правила скиллов/предметов.
+- `config/buffs.json` — профиль **баффов** (`BuffProfile`): правила, стиль пакетов баффа.
+
+На **Teon / многих L2J** тело **0x39** должно совпадать с вкладкой Buffs (`magic_skill_payload`: часто `ddd`, не `dcb`), иначе спойл/свип с пакетом `39` могут рвать сессию. Альтернатива — `combat_skill_packet` **`2f`** (как каст с панели).
+
+Сохранение из UI всегда пишет в **per-character** путь (если движок ещё не знает персонажа — в legacy `config/*.json`). Загрузка: `load_profile` / `load_buff_profile` с `character_name=…` (см. `engine.character_config`).
 
 ### `config/ui_state.json`
 
@@ -200,6 +209,7 @@ python main.py
 ## Дополнительные материалы
 
 - [recovery-sit-stand.md](recovery-sit-stand.md) — пост-убойное сидение: toggle `RequestActionUse`, `ChangeWaitType`, опция `recovery_change_wait_type_sit_raw` в `autocombat.json`.
+- [packet-verify-shard.md](packet-verify-shard.md) — как сверить `AbnormalStatusUpdate` / `PartySpelled` с вашим шардом по логу пакетов.
 
 ---
 

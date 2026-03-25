@@ -94,3 +94,17 @@ class TestTeonShortcutSkill:
         assert normalize_buff_skill_packet("39") == "39"
         assert normalize_buff_skill_packet("0x2f") == "2f"
         assert normalize_buff_skill_packet("garbage") == "39"
+
+
+class TestBuildUseSkillDcb:
+    """L2J Interlude RequestMagicSkillUse: skillId(D) + ctrl(D) + shift(C) — same field order as L2Net Use_Skill idea."""
+
+    def test_skill_91_ctrl0_shift0_golden_hex(self):
+        op, payload = csp.build_use_skill(91, False, False, payload_style="dcb")
+        assert op == 0x39
+        assert payload == bytes.fromhex("5b0000000000000000")
+
+    def test_skill_91_with_ctrl_shift(self):
+        op, payload = csp.build_use_skill(91, True, True, payload_style="dcb")
+        assert op == 0x39
+        assert payload == bytes.fromhex("5b0000000100000001")

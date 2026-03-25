@@ -95,6 +95,9 @@ class BotCore:
         self.game_session = GameSession()
         self.bot_engine: BotEngine | None = None
         self._thread: threading.Thread | None = None
+        self.autocombat_tab: object | None = None
+        # UI sets this to refresh Auto combat / Buffs when UserInfo loads per-character configs.
+        self.on_character_profiles_changed: object | None = None
 
     def start(self) -> None:
         """Start asyncio event loop in a background thread."""
@@ -169,6 +172,7 @@ class BotCore:
 
         # Start bot engine
         self.bot_engine = BotEngine(self.game_proxy)
+        self.bot_engine.profile_tabs_refresh = self._schedule_profile_tabs_refresh
         self.bot_engine.start()
 
         log.info("L2Bot ready. Start your L2 client and log in.")
@@ -182,6 +186,14 @@ class BotCore:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             pass
+
+    def _schedule_profile_tabs_refresh(self) -> None:
+        cb = getattr(self, "on_character_profiles_changed", None)
+        if cb:
+            try:
+                cb()
+            except Exception:
+                log.exception("on_character_profiles_changed callback failed")
 
     def stop(self) -> None:
         if self.loop:
@@ -223,8 +235,12 @@ class BotCore:
             self.loop.call_soon_threadsafe(self.bot_engine.set_combat_profile, profile)
 
     def reload_combat_profile_from_disk(self) -> CombatProfile:
-        """Load profile from config/autocombat.json and apply. Safe from UI thread."""
-        p = load_profile()
+        """Load combat profile for the current character (or legacy global if not in world)."""
+        be = self.bot_engine
+        if not be:
+            p = load_profile(None)
+        else:
+            p = load_profile(character_name=be.world.me.name or "")
         self.apply_combat_profile(p)
         return p
 
@@ -234,10 +250,24 @@ class BotCore:
             self.loop.call_soon_threadsafe(self.bot_engine.set_buff_profile, profile)
 
     def reload_buff_profile_from_disk(self) -> BuffProfile:
-        """Load config/buffs.json and apply. Safe from UI thread."""
-        p = load_buff_profile()
+        """Load buff profile for the current character (or legacy global if not in world)."""
+        be = self.bot_engine
+        if not be:
+            p = load_buff_profile(None)
+        else:
+            p = load_buff_profile(character_name=be.world.me.name or "")
         self.apply_buff_profile(p)
         return p
+
+    def get_packet_trace(self) -> list[tuple[str, int, str, str]]:
+        if self.game_proxy and getattr(self.game_proxy.session, "packet_trace", None):
+            return list(self.game_proxy.session.packet_trace)
+        return []
+
+    def get_combat_diagnostics(self) -> dict[str, object]:
+        if self.bot_engine:
+            return self.bot_engine.get_combat_diagnostics()
+        return {"phase": "idle", "auto_combat": False, "target": ""}
 
 
 def main() -> None:

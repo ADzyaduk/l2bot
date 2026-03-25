@@ -3,6 +3,7 @@ Session data shared between LoginProxy and GameProxy for one client connection.
 """
 from __future__ import annotations
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 
 from core.crypto.blowfish_cipher import BlowfishCipher
@@ -48,6 +49,11 @@ class GameSession:
     xor_c2s_client: object | None = None  # L2GameCrypt — tracks CLIENT's encrypt state
     xor_c2s_server: object | None = None  # L2GameCrypt — tracks SERVER's decrypt state
     xor_initialized: bool = False
+    # Recent plaintext packet hex for UI debug (dir, opcode, name, hex_str)
+    packet_trace: deque[tuple[str, int, str, str]] = field(
+        default_factory=lambda: deque(maxlen=64),
+        repr=False,
+    )
     # Back-reference to the WorldState (set by bot controller after login)
     world_state: object | None = None
     # Callback for when a parsed packet arrives (set by bot engine)

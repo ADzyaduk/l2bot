@@ -11,6 +11,7 @@ from core.packets.server import (
     ItemList,
     SkillCoolTime,
     MagicSkillLaunched,
+    PartySpelled,
 )
 from engine.world import World
 
@@ -88,6 +89,14 @@ class TestAbnormalStatusUpdate:
         pkt = AbnormalStatusUpdate.parse(body)
         assert pkt.object_id == 0x48ABCDEF
         assert {e[0] for e in pkt.effects} == {10, 91}
+
+    def test_teon_oid_dword_count_one_effect_golden(self):
+        """Teon-style SC_AbnormalStatusUpdate: int32 objectId + int32 count + effects (ihI rows)."""
+        body = struct.pack("<ii", 0x12345678, 1)
+        body += struct.pack("<ihI", 100, 1, 3600)
+        pkt = AbnormalStatusUpdate.parse(body)
+        assert pkt.object_id == 0x12345678
+        assert pkt.effects == [(100, 1, 3600)]
 
     def test_dword_count_layout(self):
         body = struct.pack("<i", 1) + struct.pack("<ihI", 500, 2, 100)
@@ -188,3 +197,136 @@ class TestMagicSkillLaunched:
         assert pkt.skill_level == 1
         assert pkt.x == 0x8F9B
         assert pkt.y == 0xD7F9
+
+
+class TestPartySpelled:
+    def test_parse_one_member_one_buff(self):
+        oid = 0x48ABCDEF
+        body = struct.pack("<iH", oid, 1)
+        body += struct.pack("<ihI", 1200, 2, 1800)
+        pkt = PartySpelled.parse(body)
+        assert pkt.object_id == oid
+        assert pkt.effects == [(1200, 2, 1800)]
+
+
+class TestWorldPartySpelled:
+    def test_party_spelled_merges_buff_ids(self):
+        w = World()
+        w.on_party_spelled(0x200, [(50, 1, 100)])
+        assert w.abnormal_skill_ids_for_object(0x200) == {50}
+
+
+class TestPickAutoCombatTarget:
+    def test_retains_current_within_distance(self):
+        from engine.world import Npc
+
+        w = World()
+        w.me.x, w.me.y, w.me.z = 0, 0, 0
+        w.npcs[100] = Npc(
+            object_id=100,
+            npc_type_id=501 + 1_000_000,
+            name="",
+            title="",
+            x=50,
+            y=0,
+            z=0,
+            heading=0,
+            is_attackable=True,
+        )
+        w.npcs[101] = Npc(
+            object_id=101,
+            npc_type_id=502 + 1_000_000,
+            name="",
+            title="",
+            x=500,
+            y=0,
+            z=0,
+            heading=0,
+            is_attackable=True,
+        )
+        a = w.pick_auto_combat_target(
+            2000.0,
+            prefer_aggro=False,
+            retain_target_oid=101,
+            retain_max_dist=800.0,
+            npc_blacklist=frozenset(),
+            attack_only_whitelist=False,
+            npc_whitelist=frozenset(),
+            target_z_range_max=0.0,
+            skip_summoned=False,
+            never_attack_oids=frozenset(),
+        )
+        assert a is not None and a.object_id == 101
+
+    def test_prefers_aggro_when_closer_non_aggro_exists(self):
+        from engine.world import Npc
+
+        w = World()
+        w.me.x, w.me.y, w.me.z = 0, 0, 0
+        w.npcs[10] = Npc(
+            object_id=10,
+            npc_type_id=1 + 1_000_000,
+            name="",
+            title="",
+            x=100,
+            y=0,
+            z=0,
+            heading=0,
+            is_attackable=True,
+        )
+        w.npcs[11] = Npc(
+            object_id=11,
+            npc_type_id=2 + 1_000_000,
+            name="",
+            title="",
+            x=300,
+            y=0,
+            z=0,
+            heading=0,
+            is_attackable=True,
+        )
+        w.register_attacker_on_me(11)
+        picked = w.pick_auto_combat_target(
+            2000.0,
+            prefer_aggro=True,
+            retain_target_oid=0,
+            retain_max_dist=0.0,
+            npc_blacklist=frozenset(),
+            attack_only_whitelist=False,
+            npc_whitelist=frozenset(),
+            target_z_range_max=0.0,
+            skip_summoned=False,
+            never_attack_oids=frozenset(),
+        )
+        assert picked is not None and picked.object_id == 11
+
+    def test_attack_only_whitelist_empty_does_not_block_everything(self):
+        """UI mistake: whitelist-only with empty list must not filter out all NPCs."""
+        from engine.world import Npc
+
+        w = World()
+        w.me.x, w.me.y, w.me.z = 0, 0, 0
+        w.npcs[7] = Npc(
+            object_id=7,
+            npc_type_id=99 + 1_000_000,
+            name="",
+            title="",
+            x=80,
+            y=0,
+            z=0,
+            heading=0,
+            is_attackable=True,
+        )
+        picked = w.pick_auto_combat_target(
+            2000.0,
+            prefer_aggro=False,
+            retain_target_oid=0,
+            retain_max_dist=0.0,
+            npc_blacklist=frozenset(),
+            attack_only_whitelist=True,
+            npc_whitelist=frozenset(),
+            target_z_range_max=0.0,
+            skip_summoned=False,
+            never_attack_oids=frozenset(),
+        )
+        assert picked is not None and picked.object_id == 7
