@@ -897,6 +897,38 @@ class PartySmallWindowDelete:
         return self
 
 
+@dataclass
+class PartySmallWindowUpdate:
+    """Real-time HP/MP/CP update for one party member."""
+
+    opcode = 0x52
+    object_id: int = 0
+    cur_hp: int = 0
+    max_hp: int = 0
+    cur_mp: int = 0
+    max_mp: int = 0
+    cur_cp: int = 0
+    max_cp: int = 0
+
+    @classmethod
+    def parse(cls, payload: bytes) -> "PartySmallWindowUpdate":
+        self = cls()
+        if len(payload) < 28:
+            return self
+        try:
+            p = BasePacket(payload)
+            self.object_id = p.read_int()
+            self.cur_hp = p.read_int()
+            self.max_hp = p.read_int()
+            self.cur_mp = p.read_int()
+            self.max_mp = p.read_int()
+            self.cur_cp = p.read_int()
+            self.max_cp = p.read_int()
+        except Exception:
+            pass
+        return self
+
+
 # ------------------------------------------------------------------ #
 # SC_PartySpelled (L2J Interlude base ~0xEE) — buff list for one party member
 # ------------------------------------------------------------------ #

@@ -122,6 +122,7 @@ class L2BotApp:
         from ui.tabs.tab_monsters import MonstersTab
         from ui.tabs.tab_autocombat import AutoCombatTab
         from ui.tabs.tab_buffs import BuffsTab
+        from ui.tabs.tab_party_heal import PartyHealTab
         from ui.tabs.tab_log import LogTab
         from ui.tabs.tab_settings import SettingsTab
         from ui.tabs.tab_script import ScriptTab
@@ -130,6 +131,7 @@ class L2BotApp:
         self._monsters_tab = MonstersTab(notebook, self.bot)
         self._autocombat_tab = AutoCombatTab(notebook, self.bot)
         self._buffs_tab = BuffsTab(notebook, self.bot)
+        self._party_heal_tab = PartyHealTab(notebook, self.bot)
         self._script_tab = ScriptTab(notebook, self.bot)
         self._log_tab = LogTab(notebook, self.bot)
         self._settings_tab = SettingsTab(notebook, self.bot)
@@ -139,6 +141,7 @@ class L2BotApp:
             (self._monsters_tab.frame, "Monsters"),
             (self._autocombat_tab.frame, "Auto combat"),
             (self._buffs_tab.frame, "Buffs"),
+            (self._party_heal_tab.frame, "Party"),
             (self._script_tab.frame, "Script"),
             (self._log_tab.frame, "Log"),
             (self._settings_tab.frame, "Settings"),
@@ -170,6 +173,7 @@ class L2BotApp:
         for tab in (
             getattr(self, "_autocombat_tab", None),
             getattr(self, "_buffs_tab", None),
+            getattr(self, "_party_heal_tab", None),
         ):
             if tab is not None and hasattr(tab, "refresh_profile_from_disk"):
                 tab.refresh_profile_from_disk()

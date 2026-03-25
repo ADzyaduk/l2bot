@@ -61,6 +61,15 @@ def character_buff_profile_path(character_name: str | None, root: Path | None = 
     return character_config_dir(character_name, root) / "buffs.json"
 
 
+def legacy_party_profile_path(root: Path | None = None) -> Path:
+    base = root or project_root()
+    return base / "config" / "party.json"
+
+
+def character_party_profile_path(character_name: str | None, root: Path | None = None) -> Path:
+    return character_config_dir(character_name, root) / "party.json"
+
+
 def resolve_combat_profile_read_path(
     *,
     character_name: str | None,
@@ -124,3 +133,32 @@ def resolve_buff_profile_write_path(
     if character_name is None:
         return legacy_buff_profile_path(r)
     return character_buff_profile_path(character_name, r)
+
+
+def resolve_party_profile_read_path(
+    *,
+    character_name: str | None,
+    root: Path | None = None,
+) -> tuple[Path, bool]:
+    r = root or project_root()
+    if character_name is None:
+        leg = legacy_party_profile_path(r)
+        return leg, False
+    primary = character_party_profile_path(character_name, r)
+    if primary.is_file():
+        return primary, True
+    leg = legacy_party_profile_path(r)
+    if leg.is_file():
+        return leg, False
+    return primary, True
+
+
+def resolve_party_profile_write_path(
+    *,
+    character_name: str | None,
+    root: Path | None = None,
+) -> Path:
+    r = root or project_root()
+    if character_name is None:
+        return legacy_party_profile_path(r)
+    return character_party_profile_path(character_name, r)

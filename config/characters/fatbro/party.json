@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "rules": [],
+  "heal_self_first": true,
+  "self_hp_critical_pct": 30.0,
+  "poll_interval_sec": 0.5,
+  "target_switch_delay_sec": 0.3,
+  "magic_skill_payload": "ddd",
+  "party_skill_packet": "2f",
+  "pause_while_combat_engaged": false
+}

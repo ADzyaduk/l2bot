@@ -21,6 +21,7 @@ from core.packets.server import (
     PartySmallWindowAdd,
     PartySmallWindowAll,
     PartySmallWindowDelete,
+    PartySmallWindowUpdate,
     ShortBuffStatusUpdate,
 )
 from core.packets import client as cs
@@ -39,6 +40,7 @@ from engine.buff_profile import (
     normalize_self_buff_precast,
     normalize_target_cancel_payload,
 )
+from engine.party_profile import PartyProfile, PartyHealRule, load_party_profile
 from engine.world import World, Npc, GroundItem
 
 log = logging.getLogger(__name__)
@@ -126,6 +128,15 @@ class BotEngine:
         self._combat_anchor: tuple[int, int, int] | None = None
         self._no_mob_anchor_since: float | None = None
 
+        # Party heal/buff support
+        self._party_profile: PartyProfile = load_party_profile(None)
+        self._party_task: Optional[asyncio.Task] = None
+        self._party_last_cast: dict[int, float] = {}  # rule_idx → monotonic
+        self._party_skill_packet: str = self._party_profile.party_skill_packet
+        self._magic_skill_party: str = normalize_magic_skill_payload(
+            self._party_profile.magic_skill_payload
+        )
+
     def start(self) -> None:
         """Hook into GameProxy to receive server packets."""
         self.game_proxy.on_server_packet = self._dispatch
@@ -140,6 +151,10 @@ class BotEngine:
             self._buff_task.cancel()
         self._buff_task = None
         self._buff_last_cast.clear()
+        if self._party_task and not self._party_task.done():
+            self._party_task.cancel()
+        self._party_task = None
+        self._party_last_cast.clear()
         self._handlers.clear()
         self._detector.reset()
         self.world = World()
@@ -158,23 +173,30 @@ class BotEngine:
         self._disk_profile_key = None
         self.set_combat_profile(load_profile(None))
         self.set_buff_profile(load_buff_profile(None))
+        self.set_party_profile(load_party_profile(None))
         self._log_buff_profile_loaded("new_session")
         game_reference.clear_session_extras()
         log.info("[BotEngine] New game session — opcode detector reset")
 
     def _on_game_connection_lost(self) -> None:
         """Game TCP closed (client or server leg) — stop bot activity that would spam injects."""
-        log.info("[BotEngine] Game connection lost — stopping auto-combat and buff loop")
+        log.info("[BotEngine] Game connection lost — stopping auto-combat, buff and party loops")
         self.stop_auto_combat()
         if self._buff_task and not self._buff_task.done():
             self._buff_task.cancel()
         self._buff_task = None
+        if self._party_task and not self._party_task.done():
+            self._party_task.cancel()
+        self._party_task = None
 
     def stop(self) -> None:
         self._running = False
         if self._buff_task and not self._buff_task.done():
             self._buff_task.cancel()
         self._buff_task = None
+        if self._party_task and not self._party_task.done():
+            self._party_task.cancel()
+        self._party_task = None
         self.game_proxy.on_server_packet = None
         self.game_proxy.on_new_session = None
         self.game_proxy.on_game_connection_lost = None
@@ -234,6 +256,9 @@ class BotEngine:
         pwdd = opcodes.get("PartySmallWindowDelete")
         if pwdd is not None:
             self._handlers[pwdd] = self._on_party_small_window_delete
+        pwdu = opcodes.get("PartySmallWindowUpdate")
+        if pwdu is not None:
+            self._handlers[pwdu] = self._on_party_small_window_update
         sb_op = opcodes.get("ShortBuffStatusUpdate")
         if sb_op is not None:
             self._handlers[sb_op] = self._on_short_buff_status_update
@@ -287,6 +312,7 @@ class BotEngine:
                 pending,
             )
         self._schedule_buff_loop()
+        self._schedule_party_heal_loop()
 
     # ------------------------------------------------------------------ #
     # Packet dispatch
@@ -348,8 +374,10 @@ class BotEngine:
         if disk_key != self._disk_profile_key:
             cp = load_profile(character_name=disk_key)
             bp = load_buff_profile(character_name=disk_key)
+            pp = load_party_profile(character_name=disk_key)
             self.set_combat_profile(cp)
             self.set_buff_profile(bp)
+            self.set_party_profile(pp)
             self._disk_profile_key = disk_key
             log.info(
                 "[BotEngine] Loaded per-character profiles (key=%r) — see config/characters/",
@@ -458,6 +486,10 @@ class BotEngine:
         self._last_die_time = time.monotonic()
         if pkt.object_id == self.world.me.object_id:
             log.warning("[World] I DIED")
+            # Reset buff timers so rebuff_if_missing fires immediately after respawn
+            for idx, rule in enumerate(self._buff_profile.rules):
+                if rule.rebuff_if_missing:
+                    self._buff_last_cast.pop(idx, None)
         elif pkt.object_id in self.world.npcs:
             npc = self.world.npcs[pkt.object_id]
             log.info("[World] Mob died: npcId=%d '%s'", npc.npc_id, npc.name or npc.title)
@@ -610,6 +642,15 @@ class BotEngine:
             self.world.on_party_small_window_delete(pkt.object_id)
             log.info("[World] PartySmallWindowDelete: oid=0x%X", pkt.object_id)
 
+    def _on_party_small_window_update(self, payload: bytes) -> None:
+        pkt = PartySmallWindowUpdate.parse(payload)
+        if pkt.object_id:
+            self.world.on_party_small_window_update(pkt)
+            log.debug(
+                "[World] PartySmallWindowUpdate: oid=0x%X HP %d/%d MP %d/%d",
+                pkt.object_id, pkt.cur_hp, pkt.max_hp, pkt.cur_mp, pkt.max_mp,
+            )
+
     def _on_short_buff_status_update(self, payload: bytes) -> None:
         pkt = ShortBuffStatusUpdate.parse(payload)
         if pkt.skill_id <= 0:
@@ -642,6 +683,13 @@ class BotEngine:
         self._buff_skill_packet = normalize_buff_skill_packet(profile.buff_skill_packet)
         self._maybe_warn_combat_magic_payload_mismatch()
         self._log_buff_profile_loaded("apply")
+
+    def set_party_profile(self, profile: PartyProfile) -> None:
+        self._party_profile = profile
+        self._party_last_cast.clear()
+        self._magic_skill_party = normalize_magic_skill_payload(profile.magic_skill_payload)
+        self._party_skill_packet = profile.party_skill_packet
+        log.info("[BotEngine] Party profile applied: %d rules", len(profile.rules))
 
     def _maybe_warn_combat_magic_payload_mismatch(self) -> None:
         """dcb vs ddd on 0x39 desyncs many Teon/L2J servers → kick on Spoil/Sweep."""
@@ -937,6 +985,159 @@ class BotEngine:
         if rule.target_mode == "manual":
             return rule.target_object_id if rule.target_object_id else None
         return me.object_id
+
+    # ------------------------------------------------------------------ #
+    # Party heal / mana / buff loop
+    # ------------------------------------------------------------------ #
+
+    def _schedule_party_heal_loop(self) -> None:
+        if self._party_task and not self._party_task.done():
+            return
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+        self._party_task = loop.create_task(self._party_heal_loop())
+
+    async def _party_heal_loop(self) -> None:
+        log.info("[PartyHeal] Party heal loop started")
+        try:
+            while True:
+                tick = max(0.25, float(self._party_profile.poll_interval_sec))
+                await asyncio.sleep(tick)
+                try:
+                    await self._party_heal_tick()
+                except Exception:
+                    log.exception("[PartyHeal] Party heal tick failed")
+        except asyncio.CancelledError:
+            log.debug("[PartyHeal] Party heal loop cancelled")
+            raise
+
+    async def _party_heal_tick(self) -> None:
+        prof = self._party_profile
+        if not prof.enabled or not prof.rules:
+            return
+        # Pause during combat engagement if configured
+        if prof.pause_while_combat_engaged and self._combat_phase == "in_kill_loop":
+            return
+        me = self.world.me
+        if not me.object_id:
+            return
+        # Don't cast if we're dead
+        if me.max_hp > 0 and me.cur_hp <= 0:
+            return
+
+        now = time.monotonic()
+        party = self.world.party_members
+        if not party:
+            return
+
+        # Self-heal priority: if our HP is critical, skip party heal
+        if prof.heal_self_first and me.max_hp > 0:
+            self_hp_pct = me.hp_pct_safe
+            if self_hp_pct < prof.self_hp_critical_pct:
+                return
+
+        # Collect (member_oid, rule_idx, rule, urgency_score) candidates
+        candidates: list[tuple[int, int, PartyHealRule, float]] = []
+
+        for idx, rule in enumerate(prof.rules):
+            if not rule.enabled or rule.skill_id <= 0:
+                continue
+            # Cooldown check
+            last = self._party_last_cast.get(idx, 0.0)
+            if now - last < max(0.0, rule.cooldown_sec):
+                continue
+            # Skill ready?
+            if not self.world.is_skill_ready(rule.skill_id):
+                continue
+
+            for member_oid, member in party.items():
+                # Skip dead members
+                if member_oid in self.world.dead_ids:
+                    continue
+                if member.max_hp > 0 and member.cur_hp <= 0:
+                    continue
+
+                if rule.kind == "heal":
+                    if member.max_hp <= 0:
+                        continue
+                    hp_pct = member.cur_hp / member.max_hp * 100.0
+                    if hp_pct < rule.hp_below_pct:
+                        # Lower HP = more urgent (lower score)
+                        urgency = hp_pct - rule.priority * 100
+                        candidates.append((member_oid, idx, rule, urgency))
+
+                elif rule.kind == "mana":
+                    if member.max_mp <= 0:
+                        continue
+                    mp_pct = member.cur_mp / member.max_mp * 100.0
+                    if mp_pct < rule.mp_below_pct:
+                        urgency = mp_pct - rule.priority * 100
+                        candidates.append((member_oid, idx, rule, urgency))
+
+                elif rule.kind == "buff":
+                    # Check if buff is missing on this member
+                    eff_id = rule.check_buff_skill_id if rule.check_buff_skill_id > 0 else rule.skill_id
+                    buff_active = self.world.abnormal_buff_active(member_oid, eff_id)
+
+                    # Timer check for buff rules
+                    interval = max(1.0, rule.interval_sec)
+                    need_cast = False
+                    if rule.rebuff_if_missing:
+                        if buff_active is False:
+                            need_cast = True
+                        elif buff_active is None:
+                            need_cast = (last == 0.0) or (now >= last + interval)
+                        else:
+                            need_cast = now >= last + interval
+                    else:
+                        need_cast = (last == 0.0) or (now >= last + interval)
+
+                    if need_cast:
+                        urgency = -rule.priority * 100  # buff priority only
+                        candidates.append((member_oid, idx, rule, urgency))
+
+        if not candidates:
+            return
+
+        # Sort: lowest urgency score first (most urgent)
+        candidates.sort(key=lambda c: c[3])
+
+        # Execute the most urgent action
+        member_oid, idx, rule, _ = candidates[0]
+        member = party.get(member_oid)
+        member_name = member.name if member else f"0x{member_oid:X}"
+
+        # Target the party member
+        self.target_object(member_oid, shift=rule.target_shift_click)
+        await asyncio.sleep(max(0.05, prof.target_switch_delay_sec))
+
+        # Check skill still ready after delay
+        if not self.world.is_skill_ready(rule.skill_id):
+            return
+
+        # Cast the skill
+        self._party_use_skill(
+            rule.skill_id,
+            ctrl=rule.skill_force_ctrl,
+            shift=rule.skill_force_shift,
+        )
+        self._party_last_cast[idx] = now
+        log.info(
+            "[PartyHeal] Rule #%d %s skillId=%d → %s (oid=0x%X)",
+            idx, rule.kind, rule.skill_id, member_name, member_oid,
+        )
+
+    def _party_use_skill(self, skill_id: int, ctrl: bool = False, shift: bool = False) -> None:
+        """Cast a skill using the party profile's configured packet format."""
+        use_2f = self._party_skill_packet == "2f"
+        if use_2f:
+            opcode, payload = cs.build_shortcut_skill_use(skill_id, ctrl, shift)
+        else:
+            body = self._magic_skill_party
+            opcode, payload = cs.build_use_skill(skill_id, ctrl, shift, body_style=body)
+        self.game_proxy.inject_to_server(opcode, payload)
 
     def _npc_fightable(self, oid: int) -> bool:
         """True if oid is still a valid attack target in world (fresh dict lookup)."""
@@ -1483,6 +1684,7 @@ class BotEngine:
         """Send at most one sit toggle if we believe we are standing (avoids standing→toggle→stand bugs)."""
         me = self.world.me
         if me.me_sitting is True:
+            self._recovery_sent_sit_toggle = True  # mark so finally block always tries to stand
             return
         self.sit_stand()
         self._recovery_sent_sit_toggle = True
@@ -1493,17 +1695,24 @@ class BotEngine:
 
         MoveToPoint sync can clear me_sitting falsely; ChangeWaitType can lag — retries help."""
         me = self.world.me
-        if not (me.me_sitting is True or self._recovery_sent_sit_toggle):
+        # Exit early only when server EXPLICITLY confirmed standing (False).
+        # None (unknown) must still attempt toggles — old condition treated None as "not sitting".
+        if me.me_sitting is False and not self._recovery_sent_sit_toggle:
             return
         prof = self._combat_profile
         attempts = max(1, min(4, int(prof.recovery_stand_toggle_attempts)))
+        log.info(
+            "[AutoCombat] _ensure_standing: me_sitting=%s sent_toggle=%s attempts=%d",
+            me.me_sitting, self._recovery_sent_sit_toggle, attempts,
+        )
         for i in range(attempts):
             if not self._auto_combat:
                 break
             self.sit_stand()
             await asyncio.sleep(_RECOVERY_TOGGLE_ACK_SEC)
             me = self.world.me
-            # Only stop when server reports standing; None = unknown — keep toggling (was: «not True» exited too early).
+            log.debug("[AutoCombat] stand toggle #%d → me_sitting=%s", i + 1, me.me_sitting)
+            # Only stop when server reports standing; None = unknown — keep toggling.
             if me.me_sitting is False:
                 return
         log.warning(

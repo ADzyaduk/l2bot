@@ -56,6 +56,7 @@ INTERLUDE_SERVER_OPCODES: dict[int, str] = {
     0x4E: "SC_PartySmallWindowAll",
     0x4F: "SC_PartySmallWindowAdd",
     0x50: "SC_PartySmallWindowDelete",
+    0x52: "SC_PartySmallWindowUpdate",
     0x30: "SC_ExCharInfo",       # ~80 bytes, other players
     0x5D: "SC_ExUseSharedGroupItem",
     0x54: "SC_ExShowBaseAttributeCancel",

@@ -233,6 +233,19 @@ class World:
         if object_id:
             self.party_members.pop(object_id, None)
 
+    def on_party_small_window_update(self, pkt: object) -> None:
+        """Update HP/MP/CP for one party member from SC_PartySmallWindowUpdate."""
+        oid = getattr(pkt, "object_id", 0)
+        if not oid or oid not in self.party_members:
+            return
+        m = self.party_members[oid]
+        m.cur_hp = getattr(pkt, "cur_hp", m.cur_hp)
+        m.max_hp = getattr(pkt, "max_hp", m.max_hp)
+        m.cur_mp = getattr(pkt, "cur_mp", m.cur_mp)
+        m.max_mp = getattr(pkt, "max_mp", m.max_mp)
+        m.cur_cp = getattr(pkt, "cur_cp", m.cur_cp)
+        m.max_cp = getattr(pkt, "max_cp", m.max_cp)
+
     def on_change_wait_type(self, object_id: int, wait_type_raw: int, *, sit_raw: int = 0) -> None:
         """Update local sit state from SC_ChangeWaitType (self only)."""
         if object_id != self.me.object_id or not object_id:
@@ -505,6 +518,13 @@ class World:
         if pkt.object_id in self.npcs:
             self.npcs[pkt.object_id].is_dead = True
         self._dead_timestamps[pkt.object_id] = time.monotonic()
+        # Clear buff tracking for dead object (self or party member).
+        # Server may not send AbnormalStatusUpdate on death; without this,
+        # rebuff_if_missing thinks buffs are still present and waits full interval.
+        if pkt.object_id == self.me.object_id:
+            self.abnormal_buff_skill_ids.clear()
+        self.abnormal_buffs_by_object.pop(pkt.object_id, None)
+        self._abnormal_expire_at.pop(pkt.object_id, None)
 
     def on_skill_list(self, skills: list[tuple[int, int, bool]]) -> None:
         self.my_skills = {sid: lvl for sid, lvl, _ in skills}
